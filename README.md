@@ -17,6 +17,10 @@ The toolkit is made of four bash scripts:
 `_cleanup` is an internal companion script — you never invoke it yourself.
 `create-debian-rootfs` bind-mounts it into the build container.
 
+Implementation details (the `_cleanup` script, what `test-rootfs` checks,
+what `setup-efi` does internally, caveats, architecture mapping, and project
+layout) live in [INTERNALS.md](INTERNALS.md).
+
 ## Overview of the workflow
 
 ```
@@ -46,8 +50,12 @@ is produced.
 ## Requirements
 
 - **Docker** (daemon running; the user must be able to pull and run containers).
+- **Bash** 4.0+ (tested with bash 5.x).
 - A network connection (packages and keyrings are downloaded from Debian /
   Proxmox mirrors).
+- Sufficient disk space for the build and the resulting tarball(s):
+  ~55 MB for a minimal image, ~170 MB with a kernel, ~300 MB with ZFS (DKMS
+  build also needs room for the compiler toolchain inside the container).
 - For `setup-efi`: root privileges, `parted`, `mkfs.vfat`, `efibootmgr`, and a
   target block device.
 - For `test-rootfs`: nothing beyond `tar`, `find`, `awk`, etc. (no root needed;
@@ -55,14 +63,45 @@ is produced.
 
 ### Proxy support
 
-`docker pull` is performed by the **Docker daemon**, which does *not* inherit
-your shell's proxy variables. If you are behind a proxy:
+If you build behind an HTTP/HTTPS proxy, `create-debian-rootfs` forwards the
+standard proxy environment variables from your shell **into the build
+container** so that `apt-get` and `wget` (used for packages and keyring
+downloads) can reach the network through the proxy. The following variables are
+forwarded **only when set** (both lowercase and uppercase variants are
+checked):
 
-1. Configure the daemon's proxy (systemd drop-in or `~/.docker/config.json`),
-   then restart Docker.
-2. The build script also forwards your shell's `http_proxy` / `https_proxy` /
-   `no_proxy` / `all_proxy` / `ftp_proxy` (and uppercase variants) *into the
-   container* so `apt-get` and `wget` can reach mirrors through the proxy.
+| Variable | Purpose |
+| --- | --- |
+| `http_proxy` / `HTTP_PROXY` | Proxy for HTTP requests |
+| `https_proxy` / `HTTPS_PROXY` | Proxy for HTTPS requests |
+| `ftp_proxy` / `FTP_PROXY` | Proxy for FTP requests |
+| `no_proxy` / `NO_PROXY` | Hosts/CIDRs that bypass the proxy |
+| `all_proxy` / `ALL_PROXY` | Proxy for other protocols (e.g. SOCKS) |
+
+Proxy values are passed into the container only — they are **not** written
+into the rootfs tarball and **not** printed in the logs. Proxy URLs may
+contain credentials, so only the variable *names* are logged in verbose mode.
+
+The base image pull (`docker pull debian:<codename>`) is performed by the
+**Docker daemon**, which does *not* inherit your shell's proxy variables. If
+your daemon cannot reach the registry, configure the daemon's proxy instead,
+e.g. via a systemd drop-in:
+
+```bash
+sudo mkdir -p /etc/systemd/system/docker.service.d
+sudo tee /etc/systemd/system/docker.service.d/http-proxy.conf >/dev/null <<'EOF'
+[Service]
+Environment="HTTP_PROXY=http://corp-proxy:8080"
+Environment="HTTPS_PROXY=http://corp-proxy:8080"
+Environment="NO_PROXY=localhost,127.0.0.1"
+EOF
+sudo systemctl daemon-reload
+sudo systemctl restart docker
+```
+
+Alternatively, set the `proxies` section in `~/.docker/config.json` (see the
+Docker documentation). Either approach also injects proxy settings into
+containers automatically, which complements the explicit passthrough above.
 
 ---
 
@@ -245,38 +284,71 @@ Unattended overwrite of an existing tarball:
 ./create-debian-rootfs -k -f bookworm
 ```
 
----
+### Backports kernel (`-B` / `--backports`)
 
-## `_cleanup` (internal)
+`--backports` adds the Debian backports repository and installs the kernel
+(and headers, if ZFS is enabled) from it, giving you a newer kernel than the
+suite ships. For example, on Debian 12 (bookworm):
 
-This is the companion script that `create-debian-rootfs` bind-mounts into the
-build container at `/root/cleanup.sh` and runs there. **Do not run it
-directly.** All of its configuration is passed in via environment variables
-(`-e` flags in `create-debian-rootfs`): `WITH_PVE`, `WITH_BACKPORTS`,
-`WITH_ZFS`, `WITH_KERNEL`, `WITH_REFIND`, `CODENAME`, `ROOT_PASSWORD`,
-`FULL_PKG_LIST`, `PVE_KEYRING_URL`, `PVE_SUITE`, `PVE_FORMAT`, `KERNEL_PKG`,
-`HEADERS_PKG`, `BACKPORTS_KERNEL_PKGS`, `BACKPORTS_ZFS_PKGS`, `MAIN_PKG_LIST`,
-`ESPROOT`.
+- **Standard kernel**: `linux-image-amd64` → 6.1.x
+- **Backports kernel**: `linux-image-amd64` from `bookworm-backports` → 6.12.x
 
-It is responsible for:
+Backports also supplies ZFS packages from backports when `--with-zfs` is used,
+providing newer ZFS versions.
 
-- `apt-get update` / package installation (Debian, backports, ZFS repos, or
-  the Proxmox repo depending on flags).
-- Downloading and installing the Proxmox keyring; adding the
-  `pve-no-subscription` repo (DEB822 for trixie+, legacy format otherwise);
-  disabling the PVE enterprise repo; removing the stock Debian kernel and
-  `os-prober` for PVE builds.
-- Writing `RESUME=none` and `noresume` so the initramfs doesn't wait for a
-  non-existent resume/swap device.
-- Generating the initramfs for the installed kernel.
-- Force-creating essential `/sbin/init`, `/sbin/halt`, `/sbin/reboot`, …
-  symlinks that maintainer scripts sometimes skip in containers.
-- Setting / unlocking the root password.
-- Stripping Docker artifacts (`.dockerenv`, `Dockerfile`), apt caches/lists,
-  `/tmp` and `/var/tmp`, hostname, `resolv.conf`, `machine-id`, logs, SSH host
-  keys, udev persistent-net rules, user caches, bash history, `lost+found`.
-- Re-creating essential mount-point and `if-up.d`/`if-down.d` directories.
-- Staging rEFInd onto `${ESPROOT}/EFI/refind` when requested.
+### ZFS support (`-z` / `--with-zfs`)
+
+`--with-zfs` installs OpenZFS support:
+
+- **zfs-dkms** — ZFS kernel module (built via DKMS for the installed kernel).
+- **zfsutils-linux** — userland utilities (`zfs`, `zpool`, …).
+- **zfs-zed** — ZFS Event Daemon.
+- **zfs-initramfs** — ZFS support in initramfs (for booting from ZFS).
+- **linux-headers-\*** — kernel headers needed for DKMS compilation.
+
+ZFS requires the `contrib` and `non-free` repository components, which are
+enabled automatically. Building ZFS with DKMS compiles the kernel module
+inside the container, which takes several minutes and pulls in build tools
+(gcc, make, …). The resulting rootfs tarball is significantly larger (~280 MB
+vs ~160 MB without ZFS).
+
+### Proxmox VE (`-P` / `--pve`)
+
+`--pve` installs Proxmox VE on top of the Debian base system — its own kernel,
+management tools, and web interface. It is mutually exclusive with `-B`
+(backports) and `-z` (ZFS): the PVE kernel already includes ZFS support
+built-in, so separate DKMS packages and backports kernels are not needed. The
+ZFS userland tools are still required and are installed from the PVE repository
+(not via DKMS).
+
+What gets installed: `proxmox-default-kernel` (PVE kernel, includes the ZFS
+kernel module and AppArmor), `proxmox-ve` (meta-package: QEMU, LXC, management
+tools, web GUI), `zfsutils-linux` and `zfs-zed` and `zfs-initramfs` (from the
+PVE repo, no DKMS), `postfix` (required for PVE notifications; configured
+non-interactively), `open-iscsi` (required by PVE), and `chrony` (NTP,
+recommended by PVE). What gets removed: `linux-image-amd64` (the stock Debian
+kernel — PVE ships its own) and `os-prober` (it scans VM partitions and can
+create unwanted boot entries).
+
+The `pve-no-subscription` repository is added automatically; the
+`pve-enterprise` repository that `proxmox-ve` creates by default is
+**disabled** (renamed to `.disabled`) since it requires a paid subscription
+key. The repository format and keyring are chosen by Debian version:
+
+| Debian | PVE version | Repo format | Keyring |
+| --- | --- | --- | --- |
+| Trixie (13) | PVE 9 | deb822 `.sources` | `proxmox-archive-keyring-trixie.gpg` |
+| Bookworm (12) | PVE 8 | legacy `.list` | `proxmox-release-bookworm.gpg` |
+| Bullseye (11) | PVE 7 | legacy `.list` | `proxmox-release-bullseye.gpg` |
+
+For unknown codenames the script attempts to use the codename as the
+repository suite with the legacy format.
+
+After deploying, connect to the Proxmox VE web interface at
+`https://your-ip-address:8006`. Proxmox VE requires hostname resolution to a
+non-loopback IP address — make sure to configure `/etc/hosts` on the deployed
+system (see the [Proxmox installation
+guide](https://pve.proxmox.com/wiki/Install_Proxmox_VE_on_Debian_13_Trixie)).
 
 ---
 
@@ -306,24 +378,6 @@ is given and the file exists.
 | `-P, --pve` | Expect a PVE install: PVE kernel, no stock Debian kernel, pve-manager, the `pve-install-repo`, no `os-prober`, enterprise repo disabled, plus postfix/open-iscsi/chrony. |
 | `-h, --help` | Show the help message. |
 
-### What it checks
-
-- Critical top-level directories (`bin`, `etc`, `lib`, `usr`, `var`, `proc`,
-  `sys`, `dev`, `run`, `boot`).
-- Critical binaries/config (`/bin/sh`, `/bin/bash`, `/etc/passwd`,
-  `/etc/shadow`, `/etc/fstab`, `/etc/os-release`, `sshd`, `ssh`, …).
-- No leftover Docker artifacts (`.dockerenv`, `Dockerfile`).
-- Clean apt cache (no `.deb` files).
-- Ownership/permissions from tar headers: `/etc/shadow` `0/42` mode `640`,
-  `/etc/passwd` `0/0` mode `644`, `/usr/bin/su` setuid, `/tmp` sticky bit,
-  presence of setuid/setgid files, ownership diversity, and that the boot
-  tarball is all root-owned.
-- `/etc/machine-id` is empty/absent.
-- `/etc/os-release` identifies as Debian.
-- Optional: kernel+initramfs, rEFInd, ZFS, PVE (see flags above).
-
-Exits `0` if all checks pass, `1` if any fail.
-
 ### Option use cases
 
 - **`-k`** — confirm the split boot tarball actually contains a kernel and
@@ -333,6 +387,9 @@ Exits `0` if all checks pass, `1` if any fail.
 - **`-z`** — verify ZFS userland, module, initramfs hook, and zed are present.
 - **`-P`** — verify a Proxmox image: PVE kernel present, stock kernel gone,
   repos configured, enterprise repo disabled, dependencies present.
+
+See [INTERNALS.md](INTERNALS.md) for the full list of what `test-rootfs`
+checks.
 
 ### Examples
 
@@ -388,20 +445,6 @@ Requires root for disk operations.
 | `--esproot DIR` | ESP mount point the build used (default: `/boot/efi`). Used both to locate rEFInd inside the rootfs and as the mount point for the ESP when using `--disk`. |
 | `-h, --help` | Show the help message. |
 
-### What it does
-
-1. Detects or creates an ESP on the target disk (GPT label if none, FAT32,
-   `boot`/`esp` flags), or uses an existing partition (`-p`), or an
-   already-mounted directory (`-e`).
-2. Detects the latest kernel and matching initramfs in the rootfs.
-3. Copies rEFInd (EFI binary, sample config, icons, tools) from the rootfs to
-   `${ESP_DIR}/EFI/refind`.
-4. Generates a `refind.conf` pointing at the detected kernel/initramfs, with
-   `noresume` and a placeholder `root=ROOT_PART` you must edit.
-5. Registers rEFInd as the default EFI boot entry via `efibootmgr` (unless
-   `-n`).
-6. Unmounts the ESP if it mounted it itself (EXIT trap).
-
 ### Option use cases
 
 - **`-d`** — let the script partition and format a fresh ESP on a blank disk.
@@ -415,6 +458,9 @@ Requires root for disk operations.
   want the firmware's boot picker to find `\EFI\BOOT\BOOTX64.EFI` instead of a
   registered NVRAM entry.
 - **`--esproot`** — match a non-default ESP path used at build time.
+
+See [INTERNALS.md](INTERNALS.md) for a step-by-step breakdown of what
+`setup-efi` does.
 
 ### Examples
 
@@ -525,17 +571,72 @@ sudo ./setup-efi -d /dev/sda /mnt/rootfs
 
 ---
 
-## Notes & caveats
+## Deploying to a target system
 
-- `create-debian-rootfs` reaps leftover `debian-rootfs-build-*` containers from
-  interrupted previous runs at startup, and removes its own container via an
-  EXIT/INT/TERM/HUP/QUIT trap.
-- The split layout deliberately keeps `/boot` as an empty mount point in the
-  rootfs tarball so you can mount a separate `/boot` partition onto it.
-- `/etc/shadow` ownership (`root:shadow`, `0/42`) and setuid bits are
-  preserved by manipulating the tar stream directly rather than extracting to
-  disk, which a non-root build user could not preserve.
-- For PVE builds, `ifupdown` is **not** installed (PVE manages networking);
-  the PVE enterprise repository is disabled in favor of `pve-no-subscription`.
-- `setup-efi` always tells you to edit `ROOT_PART` in `refind.conf`; it cannot
-  guess your root partition. Use `blkid` to find the UUID.
+### With a separate `/boot` partition
+
+```bash
+# 1. Create the rootfs and boot tarballs
+./create-debian-rootfs -k -r bookworm
+
+# 2. Partition the target disk
+#    /dev/sda1: EFI System Partition (512MB, FAT32)
+#    /dev/sda2: /boot partition (1GB, ext4)
+#    /dev/sda3: Root filesystem (rest, ext4)
+
+# 3. Format and mount
+mkfs.ext4 /dev/sda3
+mkfs.ext4 /dev/sda2
+mkfs.vfat -F 32 /dev/sda1
+
+mount /dev/sda3 /mnt/rootfs
+mkdir -p /mnt/rootfs/boot
+mount /dev/sda2 /mnt/rootfs/boot
+mkdir -p /mnt/rootfs/boot/efi
+mount /dev/sda1 /mnt/rootfs/boot/efi
+
+# 4. Unpack rootfs (excludes /boot contents)
+tar -xpf debian-bookworm-rootfs.tar.gz -C /mnt/rootfs
+
+# 5. Unpack /boot to the boot partition
+tar -xpf debian-bookworm-boot.tar.gz -C /mnt/rootfs/boot
+
+# 6. Set up the EFI bootloader
+sudo ./setup-efi -e /mnt/rootfs/boot/efi /mnt/rootfs
+
+# 7. Configure root partition in rEFInd
+# Edit /mnt/rootfs/boot/efi/EFI/refind/refind.conf
+# Replace ROOT_PART with your root partition UUID (find with: blkid /dev/sda3)
+
+# 8. Configure fstab
+echo "UUID=$(blkid -o value -s UUID /dev/sda3)  /          ext4  defaults  0  1" >> /mnt/rootfs/etc/fstab
+echo "UUID=$(blkid -o value -s UUID /dev/sda2)  /boot      ext4  defaults  0  2" >> /mnt/rootfs/etc/fstab
+echo "UUID=$(blkid -o value -s UUID /dev/sda1)  /boot/efi  vfat  defaults  0  2" >> /mnt/rootfs/etc/fstab
+```
+
+### With `/boot` on the root partition
+
+```bash
+# 1. Create the rootfs and boot tarballs
+./create-debian-rootfs -k -r bookworm
+
+# 2. Unpack both to the same root
+mkdir -p /mnt/rootfs
+tar -xpf debian-bookworm-rootfs.tar.gz -C /mnt/rootfs
+tar -xpf debian-bookworm-boot.tar.gz -C /mnt/rootfs
+
+# (boot.tar.gz contains a 'boot/' prefix, so it merges correctly)
+```
+
+### Booting from ZFS
+
+If you built with ZFS support (`-z`), the initramfs includes ZFS modules. To
+boot from a ZFS root pool:
+
+```bash
+# After unpacking, configure ZFS in the initramfs
+echo "PASS=rootpool" >> /mnt/rootfs/etc/initramfs-tools/conf.d/zfs
+
+# Update the rEFInd config to load the ZFS module; the kernel line needs:
+#   root=ZFS=rootpool/ROOT/debian
+```
