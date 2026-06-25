@@ -1,0 +1,440 @@
+#!/usr/bin/env bash
+#
+# _cleanup
+#
+# Runs inside the Docker container to set up and clean the rootfs.
+# NOT intended for direct execution — invoked by
+# create-debian-rootfs via Docker volume mount.
+#
+# All configuration is passed via environment variables
+# (see the -e flags in create-debian-rootfs).
+#
+
+set -u
+
+# ── Environment variable defaults ──
+# Set by the parent script; defaults prevent
+# unset-variable errors if something changes.
+
+WITH_PVE="${WITH_PVE:-0}"
+WITH_BACKPORTS="${WITH_BACKPORTS:-0}"
+WITH_ZFS="${WITH_ZFS:-0}"
+WITH_KERNEL="${WITH_KERNEL:-0}"
+WITH_REFIND="${WITH_REFIND:-0}"
+CODENAME="${CODENAME:-}"
+ROOT_PASSWORD="${ROOT_PASSWORD:-}"
+FULL_PKG_LIST="${FULL_PKG_LIST:-}"
+PVE_KEYRING_URL="${PVE_KEYRING_URL:-}"
+PVE_SUITE="${PVE_SUITE:-}"
+PVE_FORMAT="${PVE_FORMAT:-}"
+KERNEL_PKG="${KERNEL_PKG:-}"
+HEADERS_PKG="${HEADERS_PKG:-}"
+BACKPORTS_KERNEL_PKGS="${BACKPORTS_KERNEL_PKGS:-}"
+BACKPORTS_ZFS_PKGS="${BACKPORTS_ZFS_PKGS:-}"
+MAIN_PKG_LIST="${MAIN_PKG_LIST:-}"
+ESPROOT="${ESPROOT:-/boot/efi}"
+
+# ── Utility Functions ──
+
+# Print an informational message
+# Parameters: $* = message text
+info() {
+   printf '[container] %s\n' "$*"
+}
+
+# Print an error message to stderr and exit
+# Parameters: $* = error message text
+die() {
+   printf '[ERROR] %s\n' "$*" >&2
+   exit 1
+}
+
+# ── Main ──
+
+main() {
+   info "Starting rootfs setup & cleanup..."
+
+   # ── Install packages ──
+   if [[ -n "${FULL_PKG_LIST}" ]]; then
+      # ── Install packages ──
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update || die "apt-get update failed"
+
+      if [[ "${WITH_PVE}" -eq 1 ]]; then
+         # ── PVE installation ──
+         #    1. Download PVE repository keyring
+         #    2. Add PVE repository
+         #    3. Install PVE kernel
+         #    4. Install PVE packages
+         #    5. Remove standard Debian kernel + os-prober
+
+         # Install wget and CA certificates for keyring
+         # download; the Docker image lacks CA certs so
+         # HTTPS downloads would fail without them
+         # ── Install wget and CA certificates ──
+         apt-get install -y --no-install-recommends \
+            wget ca-certificates \
+            || die "Failed to install wget and CA certificates"
+         update-ca-certificates 2>/dev/null || true
+
+         # Download and install PVE repository keyring
+         # ── Add PVE repository keyring ──
+         if [[ -n "${PVE_KEYRING_URL}" ]]; then
+            wget "${PVE_KEYRING_URL}" \
+               -O /usr/share/keyrings/proxmox-archive-keyring.gpg \
+               || die "Failed to download PVE keyring"
+         fi
+
+         # Add PVE repository (format depends on
+         # Debian version)
+         # ── Add PVE repository ──
+         if [[ "${PVE_FORMAT}" == "deb822" ]]; then
+            # DEB822 format (trixie+)
+            {
+               printf '%s\n' 'Types: deb'
+               printf '%s\n' 'URIs: http://download.proxmox.com/debian/pve'
+               printf '%s\n' "Suites: ${PVE_SUITE}"
+               printf '%s\n' 'Components: pve-no-subscription'
+               printf '%s\n' 'Signed-By: /usr/share/keyrings/proxmox-archive-keyring.gpg'
+            } > /etc/apt/sources.list.d/pve-install-repo.sources
+         else
+            # Legacy format (bookworm, bullseye)
+            printf '%s\n' "deb [arch=amd64] http://download.proxmox.com/debian/pve ${PVE_SUITE} pve-no-subscription" \
+               > /etc/apt/sources.list.d/pve-install-repo.list
+         fi
+
+         # Update package lists with PVE repo
+         apt-get update || die "apt-get update (with PVE repo) failed"
+         apt-get full-upgrade -y || die "apt-get full-upgrade failed"
+
+         # PVE 9 (trixie) requires
+         # non-free-firmware for early OS microcode
+         # updates and runtime firmware files.
+         # Add it to the Debian base repository sources
+         # if not already present.
+         # ── Enable non-free-firmware component ──
+         if [[ "${PVE_FORMAT}" == "deb822" ]]; then
+            # DEB822 format: add non-free-firmware to
+            # all Components lines
+            sed --in-place \
+               "s/^Components: main$/Components: main non-free-firmware/" \
+               /etc/apt/sources.list.d/debian.sources \
+               2>/dev/null || true
+            sed --in-place \
+               "s/^Components: main non-free$/Components: main non-free non-free-firmware/" \
+               /etc/apt/sources.list.d/debian.sources \
+               2>/dev/null || true
+            apt-get update || die "apt-get update (non-free-firmware) failed"
+         else
+            # Legacy format: add non-free-firmware to
+            # any main-only lines in sources.list
+            if [[ -f /etc/apt/sources.list ]]; then
+               sed --in-place \
+                  "s|main$|main non-free-firmware|g" \
+                  /etc/apt/sources.list 2>/dev/null || true
+            fi
+            apt-get update || die "apt-get update (non-free-firmware) failed"
+         fi
+
+         # Configure postfix non-interactively before
+         # installing PVE packages to avoid debconf
+         # prompts in the container
+         # ── Pre-seed postfix configuration ──
+         printf '%s\n' "postfix postfix/main_mailer_type select No configuration" \
+            | debconf-set-selections
+
+         # Install PVE kernel first
+         # ── Install PVE kernel ──
+         info "Installing PVE kernel..."
+         apt-get install -y --no-install-recommends \
+            proxmox-default-kernel \
+            || die "Failed to install PVE kernel"
+
+         # Install remaining default + PVE packages
+         # from FULL_PKG_LIST (includes proxmox-ve,
+         # postfix, open-iscsi, chrony, etc.)
+         # ── Install PVE packages ──
+         info "Installing PVE packages..."
+         # shellcheck disable=SC2086
+         apt-get install -y --no-install-recommends \
+            ${FULL_PKG_LIST} \
+            || die "Failed to install PVE packages"
+
+         # Remove the standard Debian kernel that came
+         # with the Docker image (PVE ships its own)
+         # ── Remove standard Debian kernel ──
+         info "Removing standard Debian kernel..."
+         apt-get remove -y linux-image-amd64 \
+            2>/dev/null || true
+         # Also remove any versioned kernel images
+         # that might remain
+         apt-get autoremove -y 2>/dev/null || true
+
+         # Remove os-prober (it scans VM partitions
+         # and creates unwanted boot entries)
+         # ── Remove os-prober ──
+         apt-get remove -y os-prober 2>/dev/null || true
+
+         # Disable the enterprise repository that
+         # proxmox-ve automatically creates.
+         # Without a subscription key, apt update would
+         # produce errors. The no-subscription repository
+         # (already configured above) provides the same
+         # packages without requiring a key.
+         # ── Disable enterprise repository ──
+         if [[ -f /etc/apt/sources.list.d/pve-enterprise.list ]]; then
+            mv /etc/apt/sources.list.d/pve-enterprise.list \
+               /etc/apt/sources.list.d/pve-enterprise.list.disabled \
+               2>/dev/null || true
+         fi
+         if [[ -f /etc/apt/sources.list.d/pve-enterprise.sources ]]; then
+            mv /etc/apt/sources.list.d/pve-enterprise.sources \
+               /etc/apt/sources.list.d/pve-enterprise.sources.disabled \
+               2>/dev/null || true
+         fi
+      elif [[ "${WITH_BACKPORTS}" -eq 1 ]]; then
+         # ── Backports: install kernel+headers
+         #    (and ZFS if requested) from backports
+
+         # ── Enable backports repository ──
+         printf '%s\n' "deb http://deb.debian.org/debian ${CODENAME}-backports main contrib non-free" \
+            > /etc/apt/sources.list.d/backports.list
+         apt-get update || die "apt-get update (backports) failed"
+
+         # Install kernel and headers from backports
+         # shellcheck disable=SC2086
+         apt-get install -y --no-install-recommends \
+            -t "${CODENAME}-backports" \
+            ${BACKPORTS_KERNEL_PKGS} \
+            || die "Failed to install backports kernel"
+
+         if [[ "${WITH_ZFS}" -eq 1 ]]; then
+            # shellcheck disable=SC2086
+            apt-get install -y --no-install-recommends \
+               -t "${CODENAME}-backports" \
+               ${BACKPORTS_ZFS_PKGS} \
+               || die "Failed to install backports ZFS packages"
+         fi
+
+         # Install remaining packages from standard repos
+         if [[ -n "${MAIN_PKG_LIST}" ]]; then
+            # shellcheck disable=SC2086
+            apt-get install -y --no-install-recommends \
+               ${MAIN_PKG_LIST} \
+               || die "Failed to install main packages"
+         fi
+      elif [[ "${WITH_ZFS}" -eq 1 ]]; then
+         # ── ZFS without backports:
+         #    enable contrib/non-free first
+
+         # ── Enable contrib/non-free for ZFS ──
+         # Handle both DEB822 format (.sources)
+         # and old format (.list)
+         if [[ -f /etc/apt/sources.list.d/debian.sources ]]; then
+            # DEB822 format (Debian 12+)
+            sed --in-place \
+               "/^Components:/s/main/main contrib non-free/" \
+               /etc/apt/sources.list.d/debian.sources
+         else
+            # Old format
+            if [[ -f /etc/apt/sources.list ]]; then
+               sed --in-place \
+                  "s|main|main contrib non-free|g" \
+                  /etc/apt/sources.list
+            fi
+         fi
+         apt-get update || die "apt-get update (ZFS repos) failed"
+         # shellcheck disable=SC2086
+         apt-get install -y --no-install-recommends \
+            ${FULL_PKG_LIST} \
+            || die "Failed to install packages (with ZFS)"
+      else
+         # ── Standard: no backports, no ZFS
+         # shellcheck disable=SC2086
+         apt-get install -y --no-install-recommends \
+            ${FULL_PKG_LIST} \
+            || die "Failed to install packages"
+      fi
+      apt-get clean
+   fi
+
+   # ── Post-install: disable resume device in initramfs ──
+   #    Since this rootfs has no swap partition configured,
+   #    the initramfs would wait for a non-existent resume
+   #    device during boot, causing a "Gave up waiting for
+   #    suspend/resume device" delay. Setting RESUME=none
+   #    tells the initramfs to skip resume device detection.
+   #    Additionally, noresume is written to /etc/kernel/cmdline
+   #    so bootloaders include it on the kernel command line
+   #    and future initramfs rebuilds on the target system
+   #    also skip resume detection.
+   if [[ "${WITH_KERNEL}" -eq 1 ]]; then
+      # ── Disable resume device to avoid boot delay ──
+      info "Disabling resume device in initramfs..."
+      mkdir --parents /etc/initramfs-tools/conf.d
+      printf '%s\n' "RESUME=none" > /etc/initramfs-tools/conf.d/resume
+
+      # Write /etc/kernel/cmdline with noresume so that:
+      #   1. Bootloaders (GRUB, rEFInd) that read this file
+      #      will include noresume on the kernel command line
+      #   2. Any future update-initramfs on the target system
+      #      will see noresume and skip resume device detection
+      # This is critical because the initramfs /init script
+      # parses /proc/cmdline AFTER reading conf.d files: if
+      # resume=UUID=xxx appears on the cmdline (e.g., from a
+      # bootloader config), it overrides RESUME=none. The
+      # noresume cmdline parameter prevents this override.
+      mkdir --parents /etc/kernel
+      printf '%s\n' "noresume" > /etc/kernel/cmdline
+   fi
+
+   # ── Post-install: generate initramfs
+   #    if kernel was installed
+   if [[ "${WITH_KERNEL}" -eq 1 ]]; then
+      # ── Generate initramfs for installed kernel ──
+      KERNEL_VERSION=$(find /boot -name 'vmlinuz-*' -type f 2>/dev/null \
+         | sort --version-sort | head --lines=1 \
+         | sed 's|/boot/vmlinuz-||')
+      if [[ -n "${KERNEL_VERSION}" ]]; then
+         info "Generating initramfs for kernel ${KERNEL_VERSION}..."
+         update-initramfs -c -k "${KERNEL_VERSION}" \
+            2>/dev/null || true
+      fi
+   fi
+
+   # ── Post-install: ensure essential system symlinks ──
+   # Package maintainer scripts (systemd-sysv postinst)
+   # may skip symlink creation in container/chroot environments
+   # due to detection of /.dockerenv, missing /proc, etc.
+   # Force-create them so the rootfs boots correctly.
+   # ── Ensure essential system symlinks ──
+   # Package maintainer scripts may skip symlink creation
+   # in container/chroot environments. Force-create them.
+   info "Ensuring essential system symlinks..."
+   if [[ -x /lib/systemd/systemd ]] \
+      || [[ -x /usr/lib/systemd/systemd ]]; then
+      ln -snf /lib/systemd/systemd /sbin/init
+      ln -snf ../bin/systemctl /sbin/halt
+      ln -snf ../bin/systemctl /sbin/reboot
+      ln -snf ../bin/systemctl /sbin/poweroff
+      ln -snf ../bin/systemctl /sbin/shutdown
+      ln -snf ../bin/systemctl /sbin/telinit
+      ln -snf ../bin/systemctl /sbin/runlevel
+   fi
+
+   # ── Set root password if requested ──
+   # By default, the root account in the Debian Docker image
+   # is locked (has '!' or '*' in /etc/shadow), which causes
+   # sulogin to refuse access during boot with:
+   #   "Cannot open access to console, the root account is locked."
+   # The -R / --root-password option allows the user to:
+   #   1. Set a specific password for root (unlocks the account)
+   #   2. Use 'unlock' to remove the lock without setting a
+   #      password, allowing passwordless root login (insecure)
+   if [[ -n "${ROOT_PASSWORD}" ]]; then
+      # ── Set root password ──
+      if [[ "${ROOT_PASSWORD}" == "unlock" ]]; then
+         info "Unlocking root account (no password)..."
+         passwd --unlock root
+      else
+         info "Setting root password..."
+         printf '%s:%s\n' "root" "${ROOT_PASSWORD}" | chpasswd
+         # Also ensure the account is unlocked
+         passwd --unlock root 2>/dev/null || true
+      fi
+   fi
+
+   # ── Remove Docker-specific artifacts ──
+   rm --force /.dockerenv || true
+   rm --force /Dockerfile || true
+   rm --recursive --force /.dockerinit || true
+
+   # ── Clean apt cache and lists ──
+   apt-get clean 2>/dev/null || true
+   rm --recursive --force /var/cache/apt/archives/*.deb \
+      2>/dev/null || true
+   rm --recursive --force /var/cache/apt/archives/partial/ \
+      2>/dev/null || true
+   rm --recursive --force /var/lib/apt/lists/* \
+      2>/dev/null || true
+
+   # ── Clean /tmp and /var/tmp ──
+   rm --recursive --force /tmp/* /tmp/.* 2>/dev/null || true
+   rm --recursive --force /var/tmp/* 2>/dev/null || true
+
+   # ── Clear hostname and resolv.conf ──
+   cat /dev/null > /etc/hostname 2>/dev/null || true
+   cat /dev/null > /etc/resolv.conf 2>/dev/null || true
+
+   # ── Truncate machine-id ──
+   cat /dev/null > /etc/machine-id 2>/dev/null || true
+   if [[ -f /var/lib/dbus/machine-id ]]; then
+      cat /dev/null > /var/lib/dbus/machine-id \
+         2>/dev/null || true
+   fi
+
+   # ── Clean logs ──
+   rm --recursive --force /var/log/*.log /var/log/*.gz \
+      /var/log/*.old 2>/dev/null || true
+   cat /dev/null > /var/log/syslog 2>/dev/null || true
+   cat /dev/null > /var/log/dpkg.log 2>/dev/null || true
+   cat /dev/null > /var/log/apt/history.log \
+      2>/dev/null || true
+   cat /dev/null > /var/log/apt/term.log 2>/dev/null || true
+
+   # ── Remove SSH host keys ──
+   rm --force /etc/ssh/ssh_host_*_key* 2>/dev/null || true
+
+   # ── Clean udev rules cache ──
+   rm --force /etc/udev/rules.d/70-persistent-net.rules \
+      2>/dev/null || true
+
+   # ── Remove user caches ──
+   rm --recursive --force /root/.cache 2>/dev/null || true
+   rm --recursive --force /home/*/.cache 2>/dev/null || true
+
+   # ── Clean bash history ──
+   rm --force /root/.bash_history 2>/dev/null || true
+   unset HISTFILE 2>/dev/null || true
+
+   # ── Remove lost+found ──
+   rm --recursive --force /lost+found 2>/dev/null || true
+
+   # ── Create necessary directories ──
+   mkdir --parents /proc /sys /dev/pts /run /mnt /boot
+   mkdir --parents /etc/network/if-pre-up.d
+   mkdir --parents /etc/network/if-up.d
+   mkdir --parents /etc/network/if-down.d
+   mkdir --parents /etc/network/if-post-down.d
+
+   # ── Prepare rEFInd on ESP ──
+   if [[ -d /usr/share/refind/refind ]]; then
+      mkdir --parents "${ESPROOT}/EFI/refind"
+      cp --recursive \
+         /usr/share/refind/refind/refind.conf-sample \
+         "${ESPROOT}/EFI/refind/refind.conf" \
+         2>/dev/null || true
+      cp /usr/share/refind/refind/refind_x64.efi \
+         "${ESPROOT}/EFI/refind/" 2>/dev/null || true
+      cp --recursive /usr/share/refind/refind/icons \
+         "${ESPROOT}/EFI/refind/" 2>/dev/null || true
+      if [[ -d /usr/share/refind/refind/tools_x64 ]]; then
+         cp --recursive \
+            /usr/share/refind/refind/tools_x64 \
+            "${ESPROOT}/EFI/refind/tools" \
+            2>/dev/null || true
+      fi
+   fi
+
+   # ── Ensure hostname and resolv.conf placeholders ──
+   if [[ ! -f /etc/hostname ]]; then
+      touch /etc/hostname
+   fi
+   if [[ ! -f /etc/resolv.conf ]]; then
+      printf '%s\n' "# Generated at boot" > /etc/resolv.conf
+   fi
+
+   info "Rootfs setup & cleanup complete."
+}
+
+main "$@"

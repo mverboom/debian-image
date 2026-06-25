@@ -1,0 +1,645 @@
+#!/usr/bin/env bash
+#
+# setup-efi
+#
+# Sets up the EFI System Partition (ESP) and rEFInd boot manager on a target
+# disk or partition, after a Debian rootfs tarball has been unpacked.
+#
+# This script:
+#   1. Detects or creates an EFI System Partition on the target disk
+#   2. Formats and mounts the ESP
+#   3. Copies rEFInd files from the rootfs to the ESP
+#   4. Generates a rEFInd configuration that points to the Debian kernel
+#   5. Installs rEFInd as the default EFI boot entry
+#
+# Usage:
+#   ./setup-efi [OPTIONS] <rootfs-dir>
+#
+# Options:
+#   -d, --disk DISK      Target disk (e.g., /dev/sda) — used to create ESP
+#   -p, --esp-part NUM   Existing ESP partition number on the disk
+#   -e, --esp-dir DIR    Existing mounted ESP directory (e.g., /mnt/efi)
+#   -s, --esp-size SIZE  ESP size in MiB when creating new (default: 512)
+#   -n, --no-install     Skip efibootmgr registration (just copy files)
+#   --esproot DIR    Directory where the ESP is mounted
+#                       (default: /boot/efi). Controls the ESP
+#                       mount point used when building the rootfs.
+#   -h, --help           Show this help message
+#
+# Examples:
+#   # Auto-create ESP on a disk:
+#   ./setup-efi -d /dev/sda /mnt/rootfs
+#
+#   # Use existing ESP partition:
+#   ./setup-efi -d /dev/sda -p 1 /mnt/rootfs
+#
+#   # Use already-mounted ESP:
+#   ./setup-efi -e /mnt/efi /mnt/rootfs
+#
+
+set -u
+
+SCRIPT_NAME="$(basename "$0")"
+readonly SCRIPT_NAME
+
+# ─── Defaults ─────────────────────────────────────────────────────────────────
+
+ROOTFS_DIR=""
+DISK=""
+ESP_PART=""
+ESP_DIR=""
+ESP_SIZE=512
+NO_INSTALL=0
+ESPROOT="/boot/efi"
+MOUNTED_ESP=0  # Track if we mounted the ESP ourselves
+
+# ─── Utility Functions ────────────────────────────────────────────────────────
+
+# Print usage information to stdout
+usage() {
+   cat <<-EOF
+	Usage: ${SCRIPT_NAME} [OPTIONS] <rootfs-dir>
+
+	Set up the EFI System Partition (ESP) and rEFInd boot manager.
+
+	Arguments:
+	  <rootfs-dir>         Directory where the Debian rootfs
+	                        tarball was unpacked
+
+	Options:
+	  -d, --disk DISK       Target disk (e.g., /dev/sda) for
+	                        creating/finding ESP
+	  -p, --esp-part NUM    Existing ESP partition number on
+	                        the disk
+	  -e, --esp-dir DIR     Already-mounted ESP directory
+	                        (skips disk operations)
+	  -s, --esp-size SIZE   ESP size in MiB when creating new
+	                        (default: 512)
+	  -n, --no-install      Skip efibootmgr registration
+	                        (just copy files)
+	  --esproot DIR      Directory where ESP is mounted
+	                        (default: /boot/efi). Used to
+	                        locate rEFInd files in the rootfs
+	                        and as the mount point for the ESP
+	                        when using --disk.
+	  -h, --help            Show this help message
+
+	Examples:
+	  ${SCRIPT_NAME} -d /dev/sda /mnt/rootfs
+	  ${SCRIPT_NAME} -d /dev/sda -p 1 /mnt/rootfs
+	  ${SCRIPT_NAME} -e /boot/efi /mnt/rootfs
+	  ${SCRIPT_NAME} -d /dev/sda --esproot /boot/esp /mnt/rootfs
+	EOF
+}
+
+# Print informational message to stdout
+info() {
+   printf '[+] %s\n' "$*"
+}
+
+# Print warning message to stderr
+warn() {
+   printf '[!] %s\n' "$*" >&2
+}
+
+# Print error message to stderr and exit with status 1
+# Parameters: $* = error message text
+error() {
+   printf '[ERROR] %s\n' "$*" >&2
+   exit 1
+}
+
+# ─── Argument Parsing ─────────────────────────────────────────────────────────
+
+# Parse command-line arguments; sets ROOTFS_DIR, DISK, ESP_* globals
+# Exits on unknown option.
+parse_args() {
+   while [[ $# -gt 0 ]]; do
+      case "$1" in
+         -d|--disk)
+            DISK="$2"
+            shift 2
+            ;;
+         -p|--esp-part)
+            ESP_PART="$2"
+            shift 2
+            ;;
+         -e|--esp-dir)
+            ESP_DIR="$2"
+            shift 2
+            ;;
+         -s|--esp-size)
+            ESP_SIZE="$2"
+            shift 2
+            ;;
+         -n|--no-install)
+            NO_INSTALL=1
+            shift
+            ;;
+         --esproot)
+            ESPROOT="$2"
+            shift 2
+            ;;
+         -h|--help)
+            usage
+            exit 0
+            ;;
+         --*)
+            error "Unknown option: $1"
+            ;;
+         *)
+            if [[ -z "${ROOTFS_DIR}" ]]; then
+               ROOTFS_DIR="$1"
+            else
+               error "Unexpected argument: $1"
+            fi
+            shift
+            ;;
+      esac
+   done
+}
+
+# ─── Validation ───────────────────────────────────────────────────────────────
+
+# Validate all required inputs and prerequisite files
+# Exits on any validation failure.
+validate_input() {
+   if [[ -z "${ROOTFS_DIR}" ]]; then
+      error "No rootfs directory specified." \
+         "Run '${SCRIPT_NAME} --help' for usage."
+   fi
+
+   if [[ ! -d "${ROOTFS_DIR}" ]]; then
+      error "Rootfs directory '${ROOTFS_DIR}' does not exist."
+   fi
+
+   # Check for kernel in rootfs (either in /boot directly
+   # or in split layout)
+   if ! compgen -G "${ROOTFS_DIR}/boot/vmlinuz-*" >/dev/null \
+      && ! compgen -G "${ROOTFS_DIR}/vmlinuz-*" >/dev/null; then
+      error "No kernel found in ${ROOTFS_DIR}/boot/." \
+         "Use --with-kernel when creating the tarball."
+   fi
+
+   # Check for rEFInd files
+   if [[ ! -d "${ROOTFS_DIR}${ESPROOT}/EFI/refind" ]] \
+      && [[ ! -d "${ROOTFS_DIR}/usr/share/refind/refind" ]] \
+      && [[ ! -d "${ROOTFS_DIR}/boot/efi/EFI/refind" ]] \
+      && [[ ! -d "${ROOTFS_DIR}/efi/EFI/refind" ]]; then
+      error "No rEFInd files found in rootfs." \
+         "Use --with-refind when creating the tarball."
+   fi
+
+   # Must specify either --esp-dir or --disk
+   if [[ -z "${ESP_DIR}" ]] && [[ -z "${DISK}" ]]; then
+      error "Must specify either --disk or --esp-dir." \
+         "Run '${SCRIPT_NAME} --help' for usage."
+   fi
+
+   # Validate disk if specified
+   if [[ -n "${DISK}" ]]; then
+      if [[ ! -b "${DISK}" ]]; then
+         error "Disk '${DISK}' is not a block device."
+      fi
+      # Check for root/admin privileges when using disk
+      if (( $(id --user) != 0 )); then
+         error "Root privileges required for disk operations." \
+            "Run with sudo."
+      fi
+   fi
+
+   # Validate esp-size
+   if (( ESP_SIZE < 100 )); then
+      error "ESP size must be at least 100 MiB."
+   fi
+}
+
+# ─── ESP Setup ────────────────────────────────────────────────────────────────
+
+# Find an existing ESP or create a new one on the target disk
+# Sets ESP_DIR and MOUNTED_ESP globals.
+find_or_create_esp() {
+   # If --esp-dir was provided, just use it
+   if [[ -n "${ESP_DIR}" ]]; then
+      if [[ ! -d "${ESP_DIR}" ]]; then
+         error "ESP directory '${ESP_DIR}' does not exist."
+      fi
+      info "Using existing ESP mount: ${ESP_DIR}"
+      return
+   fi
+
+   # If --esp-part was provided, use that partition
+   if [[ -n "${ESP_PART}" ]]; then
+      local esp_device="${DISK}${ESP_PART}"
+      # Handle nvme device naming
+      # (/dev/nvme0n1p1 vs /dev/sda1)
+      if [[ "${DISK}" =~ nvme ]]; then
+         esp_device="${DISK}p${ESP_PART}"
+      fi
+
+      if [[ ! -b "${esp_device}" ]]; then
+         error "ESP partition '${esp_device}'" \
+            "is not a block device."
+      fi
+
+      info "Using existing ESP partition: ${esp_device}"
+      ESP_DIR="${ESPROOT}"
+      mkdir --parents "${ESP_DIR}"
+      mount "${esp_device}" "${ESP_DIR}" \
+         || error "Failed to mount ${esp_device} on ${ESP_DIR}"
+      MOUNTED_ESP=1
+      info "ESP mounted at: ${ESP_DIR}"
+      return
+   fi
+
+   # No existing ESP specified — create one on the disk
+   info "Checking disk ${DISK} for existing" \
+      "partition table..."
+   if ! parted --script "${DISK}" print >/dev/null 2>/dev/null; then
+      info "Creating GPT partition table on ${DISK}..."
+      parted --script "${DISK}" mklabel gpt \
+         || error "Failed to create GPT label on ${DISK}"
+   fi
+
+   # Check if an EFI partition already exists
+   local existing_esp
+   existing_esp=$(parted --script "${DISK}" print 2>/dev/null \
+      | grep --ignore-case --extended-regexp 'boot|efi' \
+      | head --lines=1 || true)
+   if [[ -n "${existing_esp}" ]]; then
+      local part_num
+      part_num=$(printf '%s' "${existing_esp}" | awk '{print $1}')
+      info "Found existing EFI partition #${part_num}" \
+         "on ${DISK}"
+      ESP_PART="${part_num}"
+      find_or_create_esp  # recurse with ESP_PART set
+      return
+   fi
+
+   # Create a new ESP partition
+   info "Creating ${ESP_SIZE} MiB EFI System Partition" \
+      "on ${DISK}..."
+   parted --script "${DISK}" mkpart ESP fat32 1MiB \
+      "$((1 + ESP_SIZE))MiB" \
+      || error "Failed to create ESP partition"
+   parted --script "${DISK}" set 1 boot on \
+      || error "Failed to set boot flag on ESP partition"
+   # Older parted may not support 'esp' flag
+   parted --script "${DISK}" set 1 esp on 2>/dev/null \
+      || true
+
+   local esp_device="${DISK}1"
+   if [[ "${DISK}" =~ nvme ]]; then
+      esp_device="${DISK}p1"
+   fi
+
+   # Wait for partition device to appear
+   sleep 2
+   if [[ ! -b "${esp_device}" ]]; then
+      partprobe "${DISK}" 2>/dev/null || true
+      sleep 2
+   fi
+
+   if [[ ! -b "${esp_device}" ]]; then
+      error "Partition device '${esp_device}'" \
+         "not found after creation."
+   fi
+
+   info "Formatting ESP as FAT32..."
+   mkfs.vfat -F 32 -n EFI "${esp_device}" \
+      || error "Failed to format ESP"
+
+   ESP_DIR="${ESPROOT}"
+   mkdir --parents "${ESP_DIR}"
+   mount "${esp_device}" "${ESP_DIR}" \
+      || error "Failed to mount ESP"
+   MOUNTED_ESP=1
+   info "ESP created and mounted at: ${ESP_DIR}"
+}
+
+# ─── Detect Kernel ───────────────────────────────────────────────────────────
+
+# Find the latest kernel and initramfs in the rootfs
+# Sets DETECTED_KERNEL_VERSION and DETECTED_INITRD globals.
+detect_kernel() {
+   local kernels=()
+   local f
+   for f in "${ROOTFS_DIR}"/boot/vmlinuz-*; do
+      [[ -e "$f" ]] && kernels+=("$f")
+   done
+   for f in "${ROOTFS_DIR}"/vmlinuz-*; do
+      [[ -e "$f" ]] && kernels+=("$f")
+   done
+
+   if (( ${#kernels[@]} == 0 )); then
+      error "No kernel found in ${ROOTFS_DIR}/boot/"
+   fi
+
+   # Pick the latest version
+   local kernel
+   kernel=$(printf '%s\n' "${kernels[@]}" \
+      | sort --version-sort | tail --lines=1)
+
+   local kernel_name="${kernel##*/}"
+   DETECTED_KERNEL_VERSION="${kernel_name#vmlinuz-}"
+
+   # Find matching initramfs
+   DETECTED_INITRD=""
+   if [[ -f "${ROOTFS_DIR}/boot/initrd.img-${DETECTED_KERNEL_VERSION}" ]]; then
+      DETECTED_INITRD="/boot/initrd.img-${DETECTED_KERNEL_VERSION}"
+   elif [[ -f "${ROOTFS_DIR}/boot/initramfs-${DETECTED_KERNEL_VERSION}.img" ]]; then
+      DETECTED_INITRD="/boot/initramfs-${DETECTED_KERNEL_VERSION}.img"
+   elif [[ -f "${ROOTFS_DIR}/initrd.img-${DETECTED_KERNEL_VERSION}" ]]; then
+      DETECTED_INITRD="/initrd.img-${DETECTED_KERNEL_VERSION}"
+   elif [[ -f "${ROOTFS_DIR}/initramfs-${DETECTED_KERNEL_VERSION}.img" ]]; then
+      DETECTED_INITRD="/initramfs-${DETECTED_KERNEL_VERSION}.img"
+   fi
+
+   info "Detected kernel: ${kernel_name}"
+   if [[ -n "${DETECTED_INITRD}" ]]; then
+      local initrd_name="${DETECTED_INITRD##*/}"
+      info "Detected initrd: ${initrd_name}"
+   fi
+}
+
+# ─── Install rEFInd ──────────────────────────────────────────────────────────
+
+# Copy rEFInd files from rootfs to the ESP
+install_refind() {
+   local refind_src="${ROOTFS_DIR}${ESPROOT}/EFI/refind"
+   local refind_fallback="${ROOTFS_DIR}/usr/share/refind/refind"
+
+   # Prefer already-prepared ${ESPROOT}/EFI/refind,
+   # fall back to /usr/share/refind/refind
+   if [[ ! -d "${refind_src}" ]] \
+      && [[ -d "${refind_fallback}" ]]; then
+      refind_src="${refind_fallback}"
+   fi
+
+   # Also check the standard /boot/efi/EFI/refind path
+   if [[ ! -d "${refind_src}" ]] \
+      && [[ -d "${ROOTFS_DIR}/boot/efi/EFI/refind" ]]; then
+      refind_src="${ROOTFS_DIR}/boot/efi/EFI/refind"
+   fi
+
+   if [[ ! -d "${refind_src}" ]]; then
+      error "rEFInd source directory not found in rootfs."
+   fi
+
+   local efi_dir="${ESP_DIR}/EFI/refind"
+   mkdir --parents "${efi_dir}"
+
+   info "Copying rEFInd to ESP..."
+
+   # Copy the main EFI binary
+   local efi_binary
+   efi_binary=$(find "${refind_src}" \
+      -name "refind_*.efi" -type f 2>/dev/null \
+      | head --lines=1)
+   if [[ -z "${efi_binary}" ]]; then
+      if [[ -f "${refind_src}/refind_x64.efi" ]]; then
+         efi_binary="${refind_src}/refind_x64.efi"
+      elif [[ -f "${refind_src}/refind_aa64.efi" ]]; then
+         efi_binary="${refind_src}/refind_aa64.efi"
+      fi
+   fi
+
+   if [[ -n "${efi_binary}" ]] \
+      && [[ -f "${efi_binary}" ]]; then
+      cp "${efi_binary}" "${efi_dir}/"
+      local efi_name="${efi_binary##*/}"
+      info "  ✓ Copied ${efi_name}"
+   else
+      warn "  ✗ rEFInd EFI binary not found"
+   fi
+
+   # Copy config sample if no config exists
+   if [[ ! -f "${efi_dir}/refind.conf" ]]; then
+      if [[ -f "${refind_src}/refind.conf-sample" ]]; then
+         cp "${refind_src}/refind.conf-sample" \
+            "${efi_dir}/refind.conf"
+         info "  ✓ Copied refind.conf (from sample)"
+      fi
+   fi
+
+   # Copy icons
+   if [[ -d "${refind_src}/icons" ]]; then
+      cp --recursive "${refind_src}/icons" "${efi_dir}/"
+      info "  ✓ Copied icons"
+   fi
+
+   # Copy tools
+   local tools_dir
+   tools_dir=$(find "${refind_src}" -maxdepth 1 \
+      -type d -name "tools_*" 2>/dev/null \
+      | head --lines=1 || true)
+   if [[ -n "${tools_dir}" ]]; then
+      cp --recursive "${tools_dir}" "${efi_dir}/tools"
+      info "  ✓ Copied tools"
+   fi
+
+   info "rEFInd installed to: ${efi_dir}"
+}
+
+# ─── Generate Config ─────────────────────────────────────────────────────────
+
+# Generate a rEFInd configuration file for the Debian kernel
+# Backs up any existing config as refind.conf.bak
+generate_refind_conf() {
+   local conf_file="${ESP_DIR}/EFI/refind/refind.conf"
+
+   info "Generating rEFInd configuration..."
+
+   # Backup existing config
+   if [[ -f "${conf_file}" ]]; then
+      cp "${conf_file}" "${conf_file}.bak"
+   fi
+
+   {
+      printf '%s\n' '# rEFInd configuration for Debian'
+      printf '%s\n' '# Generated by setup-efi'
+      printf '%s\n' ''
+      printf '%s\n' '# Timeout in seconds before auto-booting'
+      printf '%s\n' '# 0 = no timeout, -1 = wait forever'
+      printf '%s\n' 'timeout 10'
+      printf '%s\n' ''
+      printf '%s\n' '# Show the rEFInd menu even if only one OS'
+      printf '%s\n' 'showtools no'
+      printf '%s\n' ''
+      printf '%s\n' '# Use a nice banner'
+      if [[ -f "${ESP_DIR}/EFI/refind/icons/os_debian.png" ]]; then
+         printf '%s\n' 'banner icons/os_debian.png'
+      else
+         printf '%s\n' '# No Debian icon found'
+      fi
+      printf '%s\n' ''
+      printf '%s\n' '# ── Debian Linux boot entry ──'
+      printf '%s\n' 'menuentry "Debian Linux" {'
+      printf '%s\n' '    icon /EFI/refind/icons/os_debian.png'
+      printf '%s\n' '    volume "RootFs"'
+      printf '%s\n' "    loader /boot/vmlinuz-${DETECTED_KERNEL_VERSION}"
+      if [[ -n "${DETECTED_INITRD}" ]]; then
+         printf '%s\n' "    initrd ${DETECTED_INITRD}"
+      fi
+      printf '%s\n' '    options "root=ROOT_PART ro noresume quiet"'
+      printf '%s\n' '    disabled'
+      printf '%s\n' '}'
+      printf '%s\n' ''
+      printf '%s\n' '# ── Manual stanza — auto-detected kernel ──'
+      printf '%s\n' '# rEFInd can auto-detect kernels in /boot'
+      printf '%s\n' '# if you install the EFI filesystem driver'
+      printf '%s\n' '# for ext4/etc. The manual stanza above'
+      printf '%s\n' '# requires editing "root=ROOT_PART" to match'
+      printf '%s\n' '# your root partition.'
+      printf '%s\n' ''
+      printf '%s\n' '# ── Scan all volumes for kernels ──'
+      printf '%s\n' 'scanfor manual,external'
+      printf '%s\n' ''
+      printf '%s\n' '# Also scan for Linux kernels'
+      printf '%s\n' '# on all filesystems'
+      printf '%s\n' 'also_scan /boot'
+      printf '%s\n' ''
+      printf '%s\n' '# Default kernel options for auto-detected'
+      printf '%s\n' '# kernels'
+      printf '%s\n' 'extra_kernel_version_strings vmlinuz-,vmlinuz'
+      printf '%s\n' 'kernel_options root=ROOT_PART ro noresume quiet'
+   } > "${conf_file}"
+
+   info "rEFInd config written to: ${conf_file}"
+   warn ""
+   warn "IMPORTANT: You must edit ${conf_file}"
+   warn "  and replace ROOT_PART with your actual root partition."
+   warn "  Examples:"
+   warn "    root=UUID=a1b2c3d4-e5f6-..."
+   warn "    root=/dev/sda2"
+   warn "  Find the UUID with: blkid"
+}
+
+# ─── Boot Entry Registration ─────────────────────────────────────────────────
+
+# Register rEFInd as an EFI boot entry using efibootmgr
+# Skipped if --no-install was specified.
+register_boot_entry() {
+   if (( NO_INSTALL == 1 )); then
+      info "Skipping efibootmgr registration (--no-install)."
+      return
+   fi
+
+   if ! command -v efibootmgr >/dev/null; then
+      warn "efibootmgr not found — skipping boot entry registration."
+      warn "Install it with: apt-get install efibootmgr"
+      warn "Then run:"
+      warn "  efibootmgr --create --disk ${DISK} --part 1 \\"
+      warn "    -L 'rEFInd' \\"
+      warn "    -l '\\EFI\\refind\\refind_x64.efi'"
+      return
+   fi
+
+   # Convert EFI/refind to UEFI backslash path notation
+   local refind_efi_path='EFI\\refind'
+
+   local efi_path
+   efi_path=$(find "${ESP_DIR}/EFI/refind" \
+      -name "refind_*.efi" -type f 2>/dev/null \
+      | head --lines=1)
+   local efi_binary_name
+   if [[ -n "${efi_path}" ]]; then
+      efi_binary_name="${efi_path##*/}"
+   else
+      efi_binary_name="refind_x64.efi"
+   fi
+
+   local part_num="${ESP_PART:-1}"
+
+   info "Registering rEFInd as EFI boot entry..."
+   efibootmgr --create --disk "${DISK}" \
+      --part "${part_num}" \
+      --label "rEFInd Boot Manager" \
+      --loader "\\${refind_efi_path}\\${efi_binary_name}" \
+      2>/dev/null || {
+      warn "Failed to register boot entry with efibootmgr."
+      warn "You can try manually:"
+      warn "  efibootmgr --create --disk ${DISK} \\"
+      warn "    --part ${part_num} --label 'rEFInd' \\"
+      warn "    --loader '\\${refind_efi_path}\\${efi_binary_name}'"
+   }
+   info "Boot entry registered."
+}
+
+# ─── Cleanup ──────────────────────────────────────────────────────────────────
+
+# Unmount the ESP if we mounted it ourselves
+cleanup() {
+   if (( MOUNTED_ESP == 1 )) \
+      && [[ -n "${ESP_DIR}" ]] \
+      && [[ -d "${ESP_DIR}" ]]; then
+      info "Unmounting ESP from ${ESP_DIR}..."
+      umount "${ESP_DIR}" 2>/dev/null || true
+   fi
+}
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
+# Main entry point: validate, set up ESP, install rEFInd
+main() {
+   parse_args "$@"
+   validate_input
+
+   trap cleanup EXIT
+
+   info "Setting up EFI boot for Debian rootfs: ${ROOTFS_DIR}"
+   printf '\n'
+
+   # Step 1: Set up the ESP
+   find_or_create_esp
+   printf '\n'
+
+   # Step 2: Detect kernel
+   detect_kernel
+   printf '\n'
+
+   # Step 3: Install rEFInd
+   install_refind
+   printf '\n'
+
+   # Step 4: Generate config
+   generate_refind_conf
+   printf '\n'
+
+   # Step 5: Register boot entry
+   register_boot_entry
+   printf '\n'
+
+   info "═══════════════════════════════════════════"
+   info "  EFI Boot Setup Complete!"
+   info "═══════════════════════════════════════════"
+   printf '\n'
+   info "  ESP location:   ${ESP_DIR}"
+   info "  rEFInd config:  ${ESP_DIR}/EFI/refind/refind.conf"
+   info "  Kernel:         vmlinuz-${DETECTED_KERNEL_VERSION}"
+   if [[ -n "${DETECTED_INITRD}" ]]; then
+      local initrd_name="${DETECTED_INITRD##*/}"
+      info "  Initrd:         ${initrd_name}"
+   fi
+   printf '\n'
+   info "  NEXT STEPS:"
+   printf '\n'
+   info "  1. Edit the rEFInd config to set the" \
+      "correct root partition:"
+   info "     Replace 'ROOT_PART' in"
+   info "       ${ESP_DIR}/EFI/refind/refind.conf"
+   info "     Use 'blkid' to find the UUID of your" \
+      "root partition."
+   printf '\n'
+   info "  2. If the rootfs is on a separate disk" \
+      "from the ESP, you must also make sure" \
+      "rEFInd can read the rootfs filesystem."
+   info "     Copy EFI drivers to" \
+      "/EFI/refind/drivers_x64/ on the ESP."
+   printf '\n'
+   info "  3. Reboot the system and select 'rEFInd'" \
+      "from the boot menu."
+   printf '\n'
+}
+
+main "$@"

@@ -1,0 +1,1433 @@
+#!/usr/bin/env bash
+#
+# create-debian-rootfs
+#
+# Creates a tar archive of a freshly installed Debian system using Docker.
+# The resulting tarball can be unpacked on an empty system and used as a
+# root filesystem.
+#
+# When a kernel is requested (-k, or any option that implies it:
+# -r/--with-refind, -z/--with-zfs, -B/--backports, -P/--pve),
+# the output is split into two tarballs:
+#   - <name>-rootfs.tar.gz  — everything except /boot
+#   - <name>-boot.tar.gz    — /boot contents without boot/ prefix
+# This makes it easy to deploy / and /boot as separate filesystems.
+#
+# Usage:
+#   ./create-debian-rootfs [OPTIONS] <codename>
+#
+# Options:
+#   -o, --output FILE     Output filename (default:
+#                          debian-<codename>-rootfs.tar.gz,
+#                          or pve-<codename>-rootfs.tar.gz with -P)
+#   -O, --output-dir DIR  Output directory (relocates the
+#                          rootfs and boot tarballs there)
+#   -a, --arch ARCH       Architecture (default: amd64)
+#   -k, --with-kernel     Include Linux kernel and initramfs
+#   -r, --with-refind     Include rEFInd boot manager
+#                          (implies --with-kernel)
+#   --esproot DIR        Directory where ESP is mounted
+#                         (default: /boot/efi)
+#   -B, --backports       Use backports repository for a newer
+#                          kernel (implies -k)
+#   -P, --pve            Install Proxmox VE on top of Debian
+#                          (implies -k; mutually exclusive with
+#                          -B and -z; PVE kernel includes ZFS)
+#   -z, --with-zfs        Include ZFS support (implies -k)
+#   -R, --root-password P Set root password and unlock the account
+#                          (default: root account remains locked).
+#                          Use 'unlock' to unlock without a password
+#   -p, --packages PKG    Comma-separated extra packages
+#   -x, --compress TYPE   Compression: gzip, xz, none
+#   -f, --force           Overwrite existing output tarballs
+#   -S, --strip-boot-symlinks
+#                        Remove symlinks in /boot/pve from the
+#                        boot tarball (only valid with --pve)
+#   -v, --verbose         Enable verbose output
+#   -h, --help            Show this help message
+#
+
+set -u
+
+# ── Constants ──
+
+SCRIPT_NAME="$(basename "$0")"
+readonly SCRIPT_NAME
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+readonly SCRIPT_DIR
+
+# Companion script that runs inside the Docker container
+readonly CLEANUP_SCRIPT="${SCRIPT_DIR}/_cleanup"
+
+readonly -a KNOWN_CODENAMES=(
+   "buster"
+   "bullseye"
+   "bookworm"
+   "trixie"
+   "sid"
+   "stable"
+   "testing"
+   "unstable"
+   "oldstable"
+)
+
+# Default packages always installed in the rootfs.
+# Note: ifupdown is intentionally NOT in this list; it is a
+# Debian-only package added in build_package_list() and is
+# excluded for PVE builds (PVE manages networking itself).
+readonly -a DEFAULT_PACKAGES=(
+   "systemd-sysv"
+   "openssh-server"
+   "openssh-client"
+   "iproute2"
+   "iputils-ping"
+   "libcap2-bin"
+   "console-setup"
+   "vim"
+   "lsb-release"
+   "gnupg"
+)
+
+# Map architecture to Debian kernel package suffix
+# shellcheck disable=SC2034
+readonly ARCH_KERNEL_MAP_amd64="amd64"
+# shellcheck disable=SC2034
+readonly ARCH_KERNEL_MAP_arm64="arm64"
+# shellcheck disable=SC2034
+readonly ARCH_KERNEL_MAP_armhf="armmp"
+
+# ── Default Options ──
+
+CODENAME=""
+OUTPUT_FILE=""
+OUTPUT_DIR=""
+ARCH="amd64"
+WITH_KERNEL=0
+WITH_REFIND=0
+ESPROOT="/boot/efi"
+WITH_BACKPORTS=0
+WITH_ZFS=0
+WITH_PVE=0
+STRIP_BOOT_SYMLINKS=0
+FORCE_OVERWRITE=0
+ROOT_PASSWORD=""
+EXTRA_PACKAGES=()
+COMPRESSION="gzip"
+VERBOSE=0
+CONTAINER_NAME=""
+STAGING_DIR=""
+
+# ── Utility Functions ──
+
+# Display usage information and exit
+usage() {
+   cat <<-EOF
+	Usage: ${SCRIPT_NAME} [OPTIONS] <codename>
+
+	Create a Debian root filesystem tarball using Docker.
+
+	When -k (--with-kernel) or -r (--with-refind) is used, two
+	tarballs are produced: one for the rootfs (excluding /boot)
+	and one for /boot contents.
+
+	Arguments:
+	  <codename>            Debian distribution codename
+	                        (e.g., bookworm, bullseye, trixie)
+
+	Options:
+	  -o, --output FILE     Output filename for the rootfs tarball
+	                        (default: debian-<codename>-rootfs.tar.gz,
+	                        or pve-<codename>-rootfs.tar.gz with -P)
+	                        A second tarball for /boot is automatically
+	                        generated when -k or -r is used.
+	  -O, --output-dir DIR  Output directory for the rootfs and boot
+	                        tarballs. Relocates the (default or -o)
+	                        filename into this directory. The directory
+	                        is created if it does not exist. Combines
+	                        with -o: only the basename of -o is kept.
+	  -a, --arch ARCH       Architecture: amd64, arm64, etc.
+	                        (default: amd64)
+	  -k, --with-kernel     Include Linux kernel and initramfs in /boot
+	  -r, --with-refind     Include rEFInd boot manager
+	                        (implies --with-kernel)
+	  --esproot DIR      Directory where ESP is mounted
+	                        (default: /boot/efi).
+	                        Controls the ESP mount point in the
+	                        rootfs and resulting tarball structure.
+	  -B, --backports       Use backports repository for a newer
+	                        kernel (implies -k)
+	  -P, --pve            Install Proxmox VE on top of Debian
+	                        (implies -k; mutually exclusive with
+	                        -B and -z; PVE kernel includes ZFS)
+	  -z, --with-zfs        Include ZFS support (implies -k)
+	  -R, --root-password P Set root password and unlock the account
+	                        (default: root account remains locked)
+	                        Use 'unlock' to unlock root without a
+	                        password (insecure, for testing only)
+	  -p, --packages PKG    Comma-separated list of extra packages
+	                        to install
+	  -x, --compress TYPE   Compression type: gzip, xz, none
+	                        (default: gzip)
+	  -f, --force           Overwrite existing output tarball(s)
+	                        without prompting (for unattended
+	                        builds)
+	  -S, --strip-boot-symlinks
+	                        Remove symlinks from /boot/pve in the
+	                        boot tarball (only valid with --pve;
+	                        useful when /boot is on VFAT which
+	                        cannot store symlinks)
+	  -v, --verbose         Enable verbose output
+	  -h, --help            Show this help message
+
+	Known codenames:
+	  $(printf '  %s\n' "${KNOWN_CODENAMES[@]}")
+
+	Output files:
+	  Without -k/-r:
+	    debian-<codename>-rootfs.tar.gz
+	        (complete rootfs including empty /boot)
+	    With -P, the prefix changes to pve-<codename>.
+
+	  With -k/-r:
+	    debian-<codename>-rootfs.tar.gz
+	        (rootfs without /boot contents)
+	    debian-<codename>-boot.tar.gz
+	        (/boot contents, without boot/ prefix)
+	    With -P, the prefix changes to pve-<codename>.
+
+	Examples:
+	  ${SCRIPT_NAME} bookworm
+	        # Minimal rootfs (single tarball)
+	  ${SCRIPT_NAME} -k bookworm
+	        # Rootfs + kernel (two tarballs)
+	  ${SCRIPT_NAME} -k -r bookworm
+	        # Rootfs + kernel + rEFInd
+	  ${SCRIPT_NAME} -k -B bookworm
+	        # Kernel from backports
+	  ${SCRIPT_NAME} -k -z bookworm
+	        # Kernel + ZFS support
+	  ${SCRIPT_NAME} -P bookworm
+	        # PVE 8 on Bookworm
+	  ${SCRIPT_NAME} -P trixie
+	        # PVE 9 on Trixie
+	  ${SCRIPT_NAME} -P -S bookworm
+	        # PVE 8, strip /boot/pve symlinks
+	  ${SCRIPT_NAME} -k -B -z -r bookworm
+	        # Backports kernel + ZFS + rEFInd
+	  ${SCRIPT_NAME} -o rootfs.tar.xz -a arm64 trixie
+	  ${SCRIPT_NAME} -k -p "vim,curl" bullseye
+	        # Kernel + extra packages
+	  ${SCRIPT_NAME} -k -R changeme bookworm
+	        # Kernel + set root password
+	  ${SCRIPT_NAME} -k -R unlock trixie
+	        # Kernel + unlock root (no password)
+	  ${SCRIPT_NAME} -O /var/builds trixie
+	        # Default name in /var/builds (dir created)
+	  ${SCRIPT_NAME} -O /var/builds -o my-rootfs.tar.xz trixie
+	        # Custom name in /var/builds
+	  ${SCRIPT_NAME} -k -f bookworm
+	        # Overwrite existing tarballs (unattended)
+	EOF
+}
+
+# Log a message if verbose mode is enabled
+log() {
+   if [[ "${VERBOSE}" -eq 1 ]]; then
+      printf '[*] %s\n' "$*"
+   fi
+}
+
+# Print an informational message
+info() {
+   printf '[+] %s\n' "$*"
+}
+
+# Print a warning message to stderr
+warn() {
+   printf '[!] %s\n' "$*" >&2
+}
+
+# Print an error message to stderr and exit
+error() {
+   printf '[ERROR] %s\n' "$*" >&2
+   exit 1
+}
+
+# yes/no string for a 0/1 flag
+yn() { (( $1 )) && printf 'yes' || printf 'no'; }
+
+# Derive the boot tarball filename from the rootfs filename
+# Arguments: $1 - rootfs filename
+# Output: boot filename printed to stdout
+get_boot_filename() {
+   local rootfs="$1"
+
+   if [[ "${rootfs}" == *-rootfs.* ]]; then
+      # Replace "-rootfs" with "-boot" in the filename
+      # e.g., debian-bookworm-rootfs.tar.gz
+      #    -> debian-bookworm-boot.tar.gz
+      local boot_file="${rootfs//-rootfs./-boot.}"
+      printf '%s\n' "${boot_file}"
+      return
+   fi
+
+   printf '%s\n' "${rootfs//-rootfs./-boot.}"
+}
+
+# Format a byte count as a human-readable size (stdlib: numfmt)
+hr_size() { numfmt --to=iec "$1" 2>/dev/null || printf '%s' "$1"; }
+
+# Format a duration in seconds as a human-readable time string
+# Arguments: $1 - total seconds
+# Output: formatted time (e.g., 2h 3m 4s)
+format_elapsed_time() {
+   local total_seconds="$1"
+   local hours=$((total_seconds / 3600))
+   local minutes=$(( (total_seconds % 3600) / 60 ))
+   local seconds=$((total_seconds % 60))
+   if (( hours > 0 )); then
+      printf '%dh %dm %ds\n' "${hours}" "${minutes}" "${seconds}"
+   elif (( minutes > 0 )); then
+      printf '%dm %ds\n' "${minutes}" "${seconds}"
+   else
+      printf '%ds\n' "${seconds}"
+   fi
+}
+
+# ── Argument Parsing ──
+
+# Parse command-line arguments into global variables
+parse_args() {
+   while [[ $# -gt 0 ]]; do
+      case "$1" in
+         --output|-o)
+            OUTPUT_FILE="$2"
+            shift 2
+            ;;
+         --output-dir|-O)
+            OUTPUT_DIR="$2"
+            shift 2
+            ;;
+         --arch|-a)
+            ARCH="$2"
+            shift 2
+            ;;
+         --with-kernel|-k)
+            WITH_KERNEL=1
+            shift
+            ;;
+         --with-refind|-r)
+            WITH_REFIND=1
+            shift
+            ;;
+         --esproot)
+            ESPROOT="$2"
+            shift 2
+            ;;
+         --backports|-B)
+            WITH_BACKPORTS=1
+            shift
+            ;;
+         --pve|-P)
+            WITH_PVE=1
+            shift
+            ;;
+         --strip-boot-symlinks|-S)
+            STRIP_BOOT_SYMLINKS=1
+            shift
+            ;;
+         --with-zfs|-z)
+            WITH_ZFS=1
+            shift
+            ;;
+         --root-password|-R)
+            ROOT_PASSWORD="$2"
+            shift 2
+            ;;
+         --packages|-p)
+            if [[ -n "$2" ]]; then
+               IFS=',' read -ra EXTRA_PACKAGES <<< "$2"
+            fi
+            shift 2
+            ;;
+         --compress|-x)
+            COMPRESSION="$2"
+            shift 2
+            ;;
+         --force|-f)
+            FORCE_OVERWRITE=1
+            shift
+            ;;
+         --verbose|-v)
+            VERBOSE=1
+            shift
+            ;;
+         --help|-h)
+            usage
+            exit 0
+            ;;
+         --*)
+            error "Unknown option: $1"
+            ;;
+         *)
+            if [[ -z "${CODENAME}" ]]; then
+               CODENAME="$1"
+            else
+               error "Unexpected argument: $1" \
+                     "(codename already set to '${CODENAME}')"
+            fi
+            shift
+            ;;
+      esac
+   done
+}
+
+# ── Validation ──
+
+# Validate all inputs and configuration before proceeding
+validate_input() {
+   if ! command -v docker &>/dev/null; then
+      error "Docker is not installed or not in PATH." \
+         "Please install Docker first."
+   fi
+
+   if ! docker info &>/dev/null; then
+      error "Docker daemon is not running. Please start Docker."
+   fi
+
+   if [[ -z "${CODENAME}" ]]; then
+      error "No Debian codename provided." \
+         "Run '${SCRIPT_NAME} --help' for usage."
+   fi
+
+   case "${COMPRESSION}" in
+      gzip|xz|none) ;;
+      *)
+         error "Unsupported compression type: '${COMPRESSION}'." \
+            "Use: gzip, xz, or none."
+         ;;
+   esac
+
+   if [[ -z "${ARCH}" ]]; then
+      error "Architecture cannot be empty."
+   fi
+
+   # Validate root password option
+   if [[ -n "${ROOT_PASSWORD}" ]] \
+      && [[ "${ROOT_PASSWORD}" != "unlock" ]] \
+      && [[ ${#ROOT_PASSWORD} -lt 1 ]]; then
+      error "Root password must not be empty." \
+         "Use 'unlock' to unlock without a password."
+   fi
+
+   # --with-refind implies --with-kernel
+   if [[ "${WITH_REFIND}" -eq 1 ]]; then
+      WITH_KERNEL=1
+   fi
+
+   # --with-zfs implies --with-kernel (ZFS needs kernel + headers)
+   if [[ "${WITH_ZFS}" -eq 1 ]]; then
+      WITH_KERNEL=1
+   fi
+
+   # --pve implies --with-kernel and is mutually
+   # exclusive with --backports and --with-zfs
+   if [[ "${WITH_PVE}" -eq 1 ]]; then
+      if [[ "${WITH_BACKPORTS}" -eq 1 ]]; then
+         error "--pve and --backports are mutually exclusive." \
+            "PVE ships its own kernel."
+      fi
+      if [[ "${WITH_ZFS}" -eq 1 ]]; then
+         error "--pve and --with-zfs are mutually exclusive." \
+            "The PVE kernel already includes ZFS support."
+      fi
+      WITH_KERNEL=1
+   fi
+
+   # --strip-boot-symlinks is only valid with --pve
+   if [[ "${STRIP_BOOT_SYMLINKS}" -eq 1 ]] \
+      && [[ "${WITH_PVE}" -eq 0 ]]; then
+      error "--strip-boot-symlinks is only valid with --pve."
+   fi
+
+   # --backports implies --with-kernel
+   if [[ "${WITH_BACKPORTS}" -eq 1 ]] \
+      && [[ "${WITH_KERNEL}" -eq 0 ]]; then
+      warn "--backports requires --with-kernel." \
+         "Enabling --with-kernel automatically."
+      WITH_KERNEL=1
+   fi
+
+   # Set default output filename
+   if [[ -z "${OUTPUT_FILE}" ]]; then
+      local ext
+      case "${COMPRESSION}" in
+         gzip) ext="tar.gz" ;;
+         xz)   ext="tar.xz" ;;
+         none) ext="tar" ;;
+      esac
+      local prefix="debian"
+      if [[ "${WITH_PVE}" -eq 1 ]]; then
+         prefix="pve"
+      fi
+      OUTPUT_FILE="${prefix}-${CODENAME}-rootfs.${ext}"
+   fi
+
+   # Apply --output-dir: relocate the output filename into the
+   # given directory. Only the basename of OUTPUT_FILE is kept,
+   # so combining --output-dir with -o <path> preserves the -o
+   # name but places it in the specified directory. The boot
+   # tarball (derived from OUTPUT_FILE) follows it automatically.
+   if [[ -n "${OUTPUT_DIR}" ]]; then
+      local out_base
+      out_base="$(basename "${OUTPUT_FILE}")"
+      OUTPUT_FILE="${OUTPUT_DIR%/}/${out_base}"
+      # Create the directory (and parents) if it doesn't exist
+      if ! mkdir --parents -- "${OUTPUT_DIR}" 2>/dev/null \
+         && [[ ! -d "${OUTPUT_DIR}" ]]; then
+         error "Failed to create output directory:" \
+            "'${OUTPUT_DIR}'"
+      fi
+   fi
+
+   # Check output files don't already exist. With --force,
+   # remove existing files instead of erroring out so the
+   # build can proceed unattended.
+   if [[ -f "${OUTPUT_FILE}" ]]; then
+      if [[ "${FORCE_OVERWRITE}" -eq 1 ]]; then
+         warn "Overwriting existing file '${OUTPUT_FILE}'" \
+            "(--force)"
+         rm --force "${OUTPUT_FILE}"
+      else
+         error "Output file '${OUTPUT_FILE}' already exists." \
+            "Remove it, specify a different name, or use" \
+            "--force to overwrite."
+      fi
+   fi
+
+   if [[ "${WITH_KERNEL}" -eq 1 ]]; then
+      local boot_file
+      boot_file=$(get_boot_filename "${OUTPUT_FILE}")
+      if [[ -f "${boot_file}" ]]; then
+         if [[ "${FORCE_OVERWRITE}" -eq 1 ]]; then
+            warn "Overwriting existing file '${boot_file}'" \
+               "(--force)"
+            rm --force "${boot_file}"
+         else
+            error "Output file '${boot_file}' already exists." \
+               "Remove it, specify a different name, or use" \
+               "--force to overwrite."
+         fi
+      fi
+   fi
+
+   # Verify companion script exists
+   if [[ ! -f "${CLEANUP_SCRIPT}" ]]; then
+      error "Companion script not found: ${CLEANUP_SCRIPT}" \
+         "This file must be in the same directory as ${SCRIPT_NAME}."
+   fi
+   if [[ ! -r "${CLEANUP_SCRIPT}" ]]; then
+      error "Companion script is not readable: ${CLEANUP_SCRIPT}"
+   fi
+}
+
+# ── Build Package List ──
+
+# Map Debian codename to PVE repository details
+# Each entry: codename -> keyring_url|suite|format
+# format is either "deb822" (trixie+) or "legacy" (bookworm and older)
+# shellcheck disable=SC2154
+readonly -A PVE_CODENAME_MAP=(
+   [trixie]="https://enterprise.proxmox.com/debian/proxmox-archive-keyring-trixie.gpg|trixie|deb822"
+   [bookworm]="https://enterprise.proxmox.com/debian/proxmox-release-bookworm.gpg|bookworm|legacy"
+   [bullseye]="https://enterprise.proxmox.com/debian/proxmox-release-bullseye.gpg|bullseye|legacy"
+)
+
+# Get PVE repository details for the given codename
+# Arguments: $1 - Debian codename
+# Output: keyring_url|suite|format  (or empty if unknown)
+get_pve_repo_info() {
+   local codename="$1"
+   printf '%s\n' "${PVE_CODENAME_MAP[${codename}]:-}"
+}
+
+# Get the kernel package name for the current architecture
+# When --pve is used, returns proxmox-default-kernel.
+# Output: kernel package name printed to stdout
+get_kernel_package() {
+   local kernel_suffix_var="ARCH_KERNEL_MAP_${ARCH}"
+   local kernel_suffix="${!kernel_suffix_var:-amd64}"
+   if [[ "${WITH_PVE}" -eq 1 ]]; then
+      printf 'proxmox-default-kernel\n'
+   else
+      printf 'linux-image-%s\n' "${kernel_suffix}"
+   fi
+}
+
+# Get the kernel headers package name for the current architecture
+# Output: headers package name printed to stdout
+get_headers_package() {
+   local kernel_suffix_var="ARCH_KERNEL_MAP_${ARCH}"
+   local kernel_suffix="${!kernel_suffix_var:-amd64}"
+   printf 'linux-headers-%s\n' "${kernel_suffix}"
+}
+
+# Build the full list of packages to install in the rootfs
+# Output: package names printed one per line to stdout
+build_package_list() {
+   local -a pkg_list=("${DEFAULT_PACKAGES[@]}")
+
+   # ifupdown is a Debian-only package; PVE manages
+   # networking itself, so do not install it for PVE builds.
+   if [[ "${WITH_PVE}" -eq 0 ]]; then
+      pkg_list+=("ifupdown")
+   fi
+
+   if [[ "${WITH_KERNEL}" -eq 1 ]]; then
+      if [[ "${WITH_PVE}" -eq 1 ]]; then
+         # PVE: use PVE kernel + meta-packages;
+         # do NOT add standard Debian kernel or ZFS DKMS.
+         # The PVE kernel has ZFS built-in, so add the
+         # userland ZFS packages (not DKMS) from the PVE repo.
+         pkg_list+=(
+            "proxmox-default-kernel"
+            "proxmox-ve"
+            "postfix"
+            "open-iscsi"
+            "chrony"
+            "initramfs-tools"
+            "zstd"
+            "zfsutils-linux"
+            "zfs-zed"
+            "zfs-initramfs"
+            "mdadm"
+         )
+      else
+         local kernel_pkg
+         kernel_pkg=$(get_kernel_package)
+         pkg_list+=("${kernel_pkg}" "initramfs-tools" "zstd")
+
+         # ZFS needs kernel headers for DKMS module building
+         if [[ "${WITH_ZFS}" -eq 1 ]]; then
+            local headers_pkg
+            headers_pkg=$(get_headers_package)
+            pkg_list+=("${headers_pkg}")
+         fi
+      fi
+   fi
+
+   if [[ "${WITH_REFIND}" -eq 1 ]]; then
+      pkg_list+=("refind")
+   fi
+
+   # ZFS packages
+   if [[ "${WITH_ZFS}" -eq 1 ]]; then
+      pkg_list+=(
+         "zfs-dkms"
+         "zfsutils-linux"
+         "zfs-zed"
+         "zfs-initramfs"
+      )
+   fi
+
+   if [[ ${#EXTRA_PACKAGES[@]} -gt 0 ]]; then
+      pkg_list+=("${EXTRA_PACKAGES[@]}")
+   fi
+
+   printf '%s\n' "${pkg_list[@]}"
+}
+
+# ── Rootfs Creation ──
+
+# Generate a unique container name for this build
+generate_container_name() {
+   CONTAINER_NAME="debian-rootfs-build-$(date +%s)-$$"
+}
+
+# Prepare environment variables and package lists
+# for the _cleanup companion script.
+# Side effect: sets CLEANUP_SCRIPT_FILE and
+# _CLEANUP_* variables used by
+# create_rootfs_container.
+prepare_cleanup_env() {
+   CLEANUP_SCRIPT_FILE="${CLEANUP_SCRIPT}"
+
+   local -a full_pkg_list
+   mapfile -t full_pkg_list < <(build_package_list)
+   _CLEANUP_FULL_PKG_LIST="${full_pkg_list[*]}"
+
+   if [[ "${WITH_PVE}" -eq 1 ]]; then
+      local pve_info
+      pve_info=$(get_pve_repo_info "${CODENAME}")
+
+      if [[ -z "${pve_info}" ]]; then
+         # Unknown codename — attempt using codename
+         # as the repo suite with legacy format
+         warn "Codename '${CODENAME}' is not in the" \
+            "PVE codename map. Attempting with" \
+            "legacy repo format."
+         _CLEANUP_PVE_KEYRING_URL=""
+         _CLEANUP_PVE_SUITE="${CODENAME}"
+         _CLEANUP_PVE_FORMAT="legacy"
+      else
+         _CLEANUP_PVE_KEYRING_URL="${pve_info%%|*}"
+         local pve_rest
+         pve_rest="${pve_info#*|}"
+         _CLEANUP_PVE_SUITE="${pve_rest%%|*}"
+         _CLEANUP_PVE_FORMAT="${pve_rest#*|}"
+      fi
+   fi
+
+   if [[ "${WITH_BACKPORTS}" -eq 1 ]]; then
+      local kernel_pkg
+      kernel_pkg=$(get_kernel_package)
+      local headers_pkg
+      headers_pkg=$(get_headers_package)
+      _CLEANUP_KERNEL_PKG="${kernel_pkg}"
+      _CLEANUP_HEADERS_PKG="${headers_pkg}"
+      _CLEANUP_BACKPORTS_KERNEL_PKGS="${kernel_pkg} ${headers_pkg}"
+
+      if [[ "${WITH_ZFS}" -eq 1 ]]; then
+         _CLEANUP_BACKPORTS_ZFS_PKGS="zfs-dkms zfsutils-linux zfs-zed zfs-initramfs"
+      else
+         _CLEANUP_BACKPORTS_ZFS_PKGS=""
+      fi
+
+      # Build the list of packages to install from
+      # standard repos (exclude those coming from
+      # backports)
+      local -a exclude_pkgs=(
+         "${kernel_pkg}"
+         "${headers_pkg}"
+         "zfs-dkms"
+         "zfsutils-linux"
+         "zfs-zed"
+         "zfs-initramfs"
+      )
+      local -a main_pkg_list=()
+      local pkg
+      for pkg in "${full_pkg_list[@]}"; do
+         local is_excluded=0
+         local excl
+         for excl in "${exclude_pkgs[@]}"; do
+            if [[ "${pkg}" == "${excl}" ]]; then
+               is_excluded=1
+               break
+            fi
+         done
+         if [[ "${is_excluded}" -eq 0 ]]; then
+            main_pkg_list+=("${pkg}")
+         fi
+      done
+      _CLEANUP_MAIN_PKG_LIST="${main_pkg_list[*]}"
+   fi
+}
+
+# Build a list of "VAR=value" entries for standard proxy
+# environment variables that are set in the host environment.
+# These are forwarded into the Docker container so apt-get and
+# wget can download packages and keyrings through the proxy.
+# Both lowercase and uppercase variants are checked; only those
+# actually set are emitted.
+# Output: one "VAR=value" entry per set variable, on stdout
+build_proxy_env_flags() {
+   local -a proxy_vars=(
+      http_proxy   HTTP_PROXY
+      https_proxy  HTTPS_PROXY
+      ftp_proxy    FTP_PROXY
+      no_proxy     NO_PROXY
+      all_proxy    ALL_PROXY
+   )
+   local var value
+   for var in "${proxy_vars[@]}"; do
+      value="${!var:-}"
+      if [[ -n "${value}" ]]; then
+         printf '%s=%s\n' "${var}" "${value}"
+      fi
+   done
+}
+
+# Return success if any standard proxy environment variable is
+# set in the host environment. Used to decide whether to show a
+# daemon-proxy hint when 'docker pull' fails, since the pull is
+# performed by the Docker daemon and does not inherit the shell's
+# proxy variables.
+proxy_env_set() {
+   local -a entries
+   mapfile -t entries < <(build_proxy_env_flags)
+   (( ${#entries[@]} > 0 ))
+}
+
+# Create and run the Docker container to build the rootfs
+create_rootfs_container() {
+   local image="debian:${CODENAME}"
+   local platform="linux/${ARCH}"
+
+   info "Pulling Docker image: ${image} (${platform})"
+   if ! docker pull --platform "${platform}" "${image}" 2>/dev/null; then
+      local pull_err
+      pull_err="Failed to pull Docker image '${image}' "
+      pull_err+="for platform '${platform}'."
+      if proxy_env_set; then
+         pull_err+=$'\n'
+         pull_err+="Proxy variables are set in your environment, but "
+         pull_err+="'docker pull' is run by the Docker daemon, which "
+         pull_err+="does NOT inherit your shell's proxy. Configure the "
+         pull_err+="daemon's proxy (systemd drop-in or "
+         # shellcheck disable=SC2088  # tilde shown literally to the user
+         pull_err+="~/.docker/config.json) and restart Docker. "
+         pull_err+="See 'Proxy Support' in the README."
+      else
+         pull_err+=$'\n'
+         pull_err+="If you are behind a proxy, note that 'docker pull' "
+         pull_err+="is run by the Docker daemon and does NOT inherit "
+         pull_err+="your shell's proxy; configure the daemon's proxy. "
+         pull_err+="See 'Proxy Support' in the README."
+      fi
+      error "${pull_err}"
+   fi
+
+   log "Creating container: ${CONTAINER_NAME}"
+   log "Cleanup script: ${CLEANUP_SCRIPT_FILE}"
+
+   # Build the list of Docker -e flags for all
+   # environment variables needed by _cleanup
+   local -a env_flags=(
+      -e "WITH_PVE=${WITH_PVE}"
+      -e "WITH_BACKPORTS=${WITH_BACKPORTS}"
+      -e "WITH_ZFS=${WITH_ZFS}"
+      -e "WITH_KERNEL=${WITH_KERNEL}"
+      -e "WITH_REFIND=${WITH_REFIND}" \
+      -e "ESPROOT=${ESPROOT}" \
+      -e "CODENAME=${CODENAME}"
+      -e "FULL_PKG_LIST=${_CLEANUP_FULL_PKG_LIST}"
+      -e "PVE_KEYRING_URL=${_CLEANUP_PVE_KEYRING_URL:-}"
+      -e "PVE_SUITE=${_CLEANUP_PVE_SUITE:-}"
+      -e "PVE_FORMAT=${_CLEANUP_PVE_FORMAT:-}"
+      -e "KERNEL_PKG=${_CLEANUP_KERNEL_PKG:-}"
+      -e "HEADERS_PKG=${_CLEANUP_HEADERS_PKG:-}"
+      -e "BACKPORTS_KERNEL_PKGS=${_CLEANUP_BACKPORTS_KERNEL_PKGS:-}"
+      -e "BACKPORTS_ZFS_PKGS=${_CLEANUP_BACKPORTS_ZFS_PKGS:-}"
+      -e "MAIN_PKG_LIST=${_CLEANUP_MAIN_PKG_LIST:-}"
+   )
+
+   # ROOT_PASSWORD may be empty; only pass it
+   # when set so _cleanup can check for
+   # non-empty
+   if [[ -n "${ROOT_PASSWORD}" ]]; then
+      env_flags+=(
+         -e "ROOT_PASSWORD=${ROOT_PASSWORD}"
+      )
+   fi
+
+   # Forward host proxy environment variables into the
+   # container so apt-get and wget can use the proxy for
+   # package and keyring downloads. Only variables that
+   # are set in the host environment are forwarded; the
+   # values themselves are never logged (they may contain
+   # credentials), only the variable names.
+   local -a proxy_entries
+   mapfile -t proxy_entries < <(build_proxy_env_flags)
+   if [[ ${#proxy_entries[@]} -gt 0 ]]; then
+      local -a proxy_names=()
+      local entry
+      for entry in "${proxy_entries[@]}"; do
+         proxy_names+=("${entry%%=*}")
+         env_flags+=( -e "${entry}" )
+      done
+      log "Forwarding proxy env vars to container:" \
+         "${proxy_names[*]}"
+   fi
+
+   info "Creating and configuring container..."
+   docker run \
+      "${env_flags[@]}" \
+      --platform "linux/${ARCH}" \
+      --name "${CONTAINER_NAME}" \
+      --volume "${CLEANUP_SCRIPT_FILE}:/root/cleanup.sh:ro" \
+      "${image}" \
+      /usr/bin/env bash /root/cleanup.sh \
+      || error "Container build failed for '${CONTAINER_NAME}'"
+
+   log "Container finished. Name: ${CONTAINER_NAME}"
+}
+
+# ── Export ──
+
+# Compress a stream from stdin into $1 (output file)
+compress_stream() {
+   case "${COMPRESSION}" in
+      gzip) gzip --best > "$1" ;;
+      xz)   xz --best > "$1" ;;
+      none) cat > "$1" ;;
+   esac
+}
+
+# Compress $1 (raw file) into $2 (output file)
+compress_file_to() {
+   case "${COMPRESSION}" in
+      gzip) gzip --best < "$1" > "$2" ;;
+      xz)   xz --best < "$1" > "$2" ;;
+      none) cat "$1" > "$2" ;;
+   esac
+}
+
+# List a (possibly compressed) tarball to stdout
+list_tar() {
+   case "${COMPRESSION}" in
+      gzip) tar --list --gzip --file "$1" ;;
+      xz)   tar --list --xz --file "$1" ;;
+      none) tar --list --file "$1" ;;
+   esac
+}
+
+# Print a tarball's size in bytes (GNU or BSD stat)
+tarball_size() {
+   stat --printf='%s' "$1" 2>/dev/null \
+      || stat -f%z "$1" 2>/dev/null \
+      || printf '0'
+}
+
+# Export the rootfs from the Docker container
+export_rootfs() {
+   if [[ "${WITH_KERNEL}" -eq 1 ]]; then
+      export_split_rootfs
+      return
+   fi
+   export_single_rootfs
+}
+
+# Export entire rootfs as a single tarball (no kernel)
+export_single_rootfs() {
+   info "Exporting rootfs from container '${CONTAINER_NAME}'..."
+
+   # The _cleanup script is bind-mounted into the container at
+   # /root/cleanup.sh (read-only) so it can be executed inside.
+   # docker export captures bind-mounted files into the archive,
+   # so strip the entry from the stream here to keep it out of
+   # the final rootfs image. tar --delete reads the archive from
+   # stdin (--file -) and writes the filtered archive to stdout.
+   # The entry is absent if docker export does not include the
+   # bind mount, in which case tar --delete is a harmless no-op.
+   docker export "${CONTAINER_NAME}" \
+      | tar --delete --file - 'root/cleanup.sh' 2>/dev/null \
+      | compress_stream "${OUTPUT_FILE}"
+
+   if [[ ${PIPESTATUS[0]} -ne 0 ]]; then
+      error "Failed to export container '${CONTAINER_NAME}'"
+   fi
+
+   info "Rootfs tarball written to: ${OUTPUT_FILE}"
+}
+
+# Export rootfs split into rootfs + boot tarballs
+export_split_rootfs() {
+   # With kernel — split into rootfs (excluding /boot contents)
+   # and boot tarballs.
+   #
+   # Boot tarball: extract /boot contents to a staging directory,
+   # then create the tar from inside that directory so paths don't
+   # have the "boot/" prefix. This way, unpacking with
+   # -C /mnt/rootfs/boot places files directly into /boot without
+   # needing --strip-components.
+   # All boot files are root:root, so we use --owner=0 --group=0
+   # when creating the tar to preserve correct ownership.
+   #
+   # Rootfs tarball: use tar --delete on a copy of the docker
+   # export archive to remove boot contents. This preserves all
+   # UIDs/GIDs/permissions without needing to extract to disk
+   # (where non-root users can't preserve ownership of files
+   # like /etc/shadow which is root:shadow 0/42).
+
+   local boot_file
+   boot_file=$(get_boot_filename "${OUTPUT_FILE}")
+
+   info "Exporting rootfs (split: rootfs + boot)" \
+      "from container '${CONTAINER_NAME}'..."
+
+   # Step 1: Export container to uncompressed tar
+   # (preserves all UIDs/GIDs/permissions)
+   local staging_tar
+   staging_tar=$(mktemp "/tmp/debian-rootfs-full-XXXXXX.tar")
+   info "Exporting container filesystem..."
+   docker export "${CONTAINER_NAME}" > "${staging_tar}" \
+      || error "Failed to export container '${CONTAINER_NAME}'"
+
+   # Strip the bind-mounted _cleanup script (root/cleanup.sh)
+   # from the staging tar. docker export captures bind-mounted
+   # files into the archive; removing it here ensures neither
+   # the rootfs nor boot tarball contains the cleanup script.
+   # tar --delete is a no-op if the entry is absent.
+   tar --delete --file "${staging_tar}" 'root/cleanup.sh' \
+      2>/dev/null || true
+
+   info "Splitting rootfs and boot tarballs..."
+
+   # ── Create boot tarball ──
+   info "Creating boot tarball: ${boot_file}"
+
+   local staging_boot
+   staging_boot=$(mktemp --directory \
+      "/tmp/debian-rootfs-boot-staging-XXXXXX")
+
+   # Extract only boot/ entries from the full tar
+   tar --extract --file "${staging_tar}" \
+      --directory "${staging_boot}" "boot"
+
+   # Remove symlinks from /boot/pve when requested.
+   # VFAT filesystems (common for EFI System Partitions)
+   # cannot store symlinks.  Deleting them avoids failures
+   # when the boot tarball is unpacked onto a VFAT /boot.
+   if [[ "${STRIP_BOOT_SYMLINKS}" -eq 1 ]]; then
+      local pve_dir="${staging_boot}/boot/pve"
+      if [[ -d "${pve_dir}" ]]; then
+         local -a pve_symlinks=()
+         mapfile -t pve_symlinks < <(
+            find "${pve_dir}" -type l -print0 \
+               | xargs --null --no-run-if-empty printf '%s\n'
+         )
+         if [[ ${#pve_symlinks[@]} -gt 0 ]]; then
+            info "Removing ${#pve_symlinks[@]} symlinks" \
+               "from /boot/pve in boot tarball"
+            local sl
+            for sl in "${pve_symlinks[@]}"; do
+               log "  Removing symlink: ${sl#"${staging_boot}/boot/"}"
+               rm --force "${sl}"
+            done
+         else
+            info "No symlinks found in /boot/pve"
+         fi
+      else
+         info "/boot/pve directory not found;" \
+            "nothing to strip"
+      fi
+   fi
+
+   # Create boot tarball from inside the boot directory.
+   # Paths will be relative (./vmlinuz..., ./efi/...)
+   # instead of boot/vmlinuz..., boot/efi/...
+   local boot_raw
+   boot_raw=$(mktemp "/tmp/debian-rootfs-boot-raw-XXXXXX.tar")
+   tar --create --file "${boot_raw}" \
+      --directory "${staging_boot}/boot" \
+      --owner=0 --group=0 --numeric-owner .
+   rm --recursive --force "${staging_boot}"
+
+   # Compress the boot tarball
+   compress_file_to "${boot_raw}" "${boot_file}"
+   rm --force "${boot_raw}"
+
+   # ── Create rootfs tarball ──
+   # Strategy: copy the full tar, delete boot sub-entries
+   # (keeping boot/ dir).
+   info "Creating rootfs tarball (without /boot contents):" \
+      "${OUTPUT_FILE}"
+
+   local rootfs_raw
+   rootfs_raw=$(mktemp "/tmp/debian-rootfs-rootfs-raw-XXXXXX.tar")
+   cp "${staging_tar}" "${rootfs_raw}"
+
+   # Delete all entries under boot/ (but not "boot/" dir itself)
+   tar --delete --wildcards \
+      --file "${rootfs_raw}" 'boot/?*' 2>/dev/null \
+      || tar --delete --file "${rootfs_raw}" \
+         --wildcards 'boot/*' 2>/dev/null \
+      || tar --delete --file "${rootfs_raw}" \
+         'boot/*' 2>/dev/null \
+      || true
+
+   # Remove root-level symlinks pointing to boot content
+   tar --delete --wildcards \
+      --file "${rootfs_raw}" 'vmlinuz*' 'initrd*' 2>/dev/null \
+      || true
+
+   # Compress the rootfs tarball
+   compress_file_to "${rootfs_raw}" "${OUTPUT_FILE}"
+
+   # Clean up
+   rm --force "${staging_tar}" "${rootfs_raw}"
+   STAGING_DIR=""
+
+   info "Boot tarball written to: ${boot_file}"
+   info "Rootfs tarball written to: ${OUTPUT_FILE}"
+}
+
+# ── Verification ──
+
+# Verify the exported rootfs tarball(s)
+verify_rootfs() {
+   if [[ "${WITH_KERNEL}" -eq 1 ]]; then
+      verify_split_rootfs
+      return
+   fi
+   verify_single_rootfs
+}
+
+# Verify a single (non-split) rootfs tarball
+verify_single_rootfs() {
+   info "Verifying rootfs tarball: ${OUTPUT_FILE}"
+
+   if [[ ! -s "${OUTPUT_FILE}" ]]; then
+      error "Output file '${OUTPUT_FILE}' is empty or missing!"
+   fi
+
+   local listing_file
+   listing_file=$(mktemp "/tmp/debian-rootfs-verify-XXXXXX")
+   list_tar "${OUTPUT_FILE}" > "${listing_file}" 2>/dev/null \
+      || error "Failed to read tarball."
+
+   local missing=0
+   local critical_dirs=("bin" "etc" "lib" "usr" "var")
+   info "Checking for critical directories..."
+   local dir
+   for dir in "${critical_dirs[@]}"; do
+      if grep --quiet --extended-regexp \
+         "^${dir}(/|$)" "${listing_file}"; then
+         log "  ✓ ${dir}"
+      else
+         warn "  ✗ ${dir} not found!"
+         missing=1
+      fi
+   done
+
+   if [[ "${missing}" -eq 0 ]]; then
+      info "Verification passed — all critical directories present."
+   else
+      warn "Verification had warnings."
+   fi
+
+   info "Tarball size: $(hr_size "$(tarball_size "${OUTPUT_FILE}")")"
+   info "Total entries: $(wc --lines < "${listing_file}" 2>/dev/null || printf 'unknown')"
+   rm --force "${listing_file}"
+}
+
+# Verify split rootfs + boot tarballs
+verify_split_rootfs() {
+   local boot_file
+   boot_file=$(get_boot_filename "${OUTPUT_FILE}")
+
+   # ── Verify rootfs tarball ──
+   info "Verifying rootfs tarball: ${OUTPUT_FILE}"
+
+   if [[ ! -s "${OUTPUT_FILE}" ]]; then
+      error "Rootfs tarball '${OUTPUT_FILE}'" \
+         "is empty or missing!"
+   fi
+
+   local rootfs_listing
+   rootfs_listing=$(mktemp "/tmp/debian-rootfs-verify-XXXXXX")
+   list_tar "${OUTPUT_FILE}" > "${rootfs_listing}" 2>/dev/null \
+      || error "Failed to read rootfs tarball."
+
+   local missing=0
+   local critical_dirs=("bin" "etc" "lib" "usr" "var")
+   info "Checking rootfs for critical directories..."
+   local dir
+   for dir in "${critical_dirs[@]}"; do
+      if grep --quiet --extended-regexp \
+         "^\.?/?${dir}(/|$)" "${rootfs_listing}"; then
+         log "  ✓ ${dir}"
+      else
+         warn "  ✗ ${dir} not found in rootfs!"
+         missing=1
+      fi
+   done
+
+   # Verify /boot exists as empty mount point in rootfs
+   info "Checking /boot mount point in rootfs..."
+   if grep --quiet --extended-regexp \
+      "^\.?/?boot/?$" "${rootfs_listing}"; then
+      info "  ✓ /boot mount point exists"
+   else
+      warn "  /boot mount point not found in rootfs" \
+         "(may need to be created manually)"
+   fi
+
+   # Verify /boot contents are NOT in the rootfs
+   info "Verifying /boot contents are in the boot tarball," \
+      "not rootfs..."
+   local boot_in_rootfs
+   boot_in_rootfs=$(grep --count --extended-regexp \
+      "^\.?/?boot/[^/]+" "${rootfs_listing}" 2>/dev/null \
+      || true)
+   boot_in_rootfs=$(printf '%s' "${boot_in_rootfs}" \
+      | head --lines=1 | tr --delete '[:space:]')
+
+   local boot_dir_entry
+   boot_dir_entry=$(grep --count --extended-regexp \
+      "^\.?/?boot/?$" "${rootfs_listing}" 2>/dev/null \
+      || true)
+   boot_dir_entry=$(printf '%s' "${boot_dir_entry}" \
+      | head --lines=1 | tr --delete '[:space:]')
+
+   # Convert to int, defaulting to 0
+   boot_in_rootfs=${boot_in_rootfs:-0}
+   boot_dir_entry=${boot_dir_entry:-0}
+   boot_in_rootfs=$((boot_in_rootfs - boot_dir_entry))
+
+   if [[ "${boot_in_rootfs}" -le 0 ]]; then
+      info "  ✓ /boot contents correctly excluded from rootfs"
+   else
+      warn "  Found ${boot_in_rootfs} files under /boot" \
+         "in rootfs tarball (expected none)"
+   fi
+
+   # ── Verify boot tarball ──
+   info "Verifying boot tarball: ${boot_file}"
+
+   if [[ ! -s "${boot_file}" ]]; then
+      error "Boot tarball '${boot_file}' is empty or missing!"
+   fi
+
+   local boot_listing
+   boot_listing=$(mktemp \
+      "/tmp/debian-rootfs-verify-boot-XXXXXX")
+   list_tar "${boot_file}" > "${boot_listing}" 2>/dev/null \
+      || error "Failed to read boot tarball."
+
+   # Check kernel
+   info "Checking for Linux kernel in boot tarball..."
+   if grep --quiet --extended-regexp \
+      "^\./vmlinuz|^vmlinuz" "${boot_listing}"; then
+      local kernel_count
+      kernel_count=$(grep --count --extended-regexp \
+         "^\./vmlinuz|^vmlinuz" "${boot_listing}")
+      info "  ✓ Found ${kernel_count} kernel image(s)"
+   else
+      warn "  ✗ No kernel image found in boot tarball!"
+      missing=1
+   fi
+
+   # Check initramfs
+   if grep --quiet --extended-regexp \
+      "^\./initrd|^initrd|^\./initramfs|^initramfs" \
+      "${boot_listing}"; then
+      info "  ✓ Found initramfs"
+   else
+      warn "  ✗ No initramfs found in boot tarball"
+      missing=1
+   fi
+
+   # Check rEFInd if requested
+   if [[ "${WITH_REFIND}" -eq 1 ]]; then
+      info "Checking for rEFInd in boot tarball..."
+      local esproot_base
+      esproot_base="${ESPROOT##*/}"
+      if grep --quiet --extended-regexp \
+         "^\./${esproot_base}/EFI/refind/|^${esproot_base}/EFI/refind/" \
+         "${boot_listing}"; then
+         info "  ✓ Found rEFInd files"
+      else
+         warn "  ✗ rEFInd files not found in boot tarball"
+         missing=1
+      fi
+   fi
+
+   # ── Summary ──
+   printf '\n'
+   if [[ "${missing}" -eq 0 ]]; then
+      info "All verifications passed ✓"
+   else
+      warn "Some verifications had warnings."
+   fi
+
+   info "Rootfs tarball: $(hr_size "$(tarball_size "${OUTPUT_FILE}")")"
+   info "Boot tarball:   $(hr_size "$(tarball_size "${boot_file}")")"
+
+   rm --force "${rootfs_listing}" "${boot_listing}"
+}
+
+# ── Cleanup ──
+
+# Remove any leftover build containers from previous runs that
+# were interrupted before their own cleanup could run (e.g. the
+# machine was power-cycled, the shell received SIGHUP from an SSH
+# disconnect, or the process was SIGKILLed — none of which fire
+# the EXIT trap). Each such container keeps its writable layer in
+# /var/lib/docker/overlay2, which is where the multi-gigabyte
+# apt-installed rootfs lives, so leaving them orphaned is what
+# fills the disk. This is called at startup, before the new
+# container is created, to reclaim that space.
+reap_leftover_containers() {
+   local leftovers=()
+   mapfile -t leftovers < <(
+      docker ps --all \
+         --filter "name=debian-rootfs-build-" \
+         --format '{{.Names}}' \
+         2>/dev/null \
+      | grep '^debian-rootfs-build-' || true
+   )
+   if (( ${#leftovers[@]} == 0 )); then
+      return
+   fi
+   log "Removing ${#leftovers[@]} leftover build container(s)"
+   log "  from previous runs: ${leftovers[*]}"
+   local name
+   for name in "${leftovers[@]}"; do
+      docker rm --force "${name}" &>/dev/null || true
+   done
+}
+
+# Clean up Docker container and temporary files
+cleanup() {
+   if [[ -n "${CONTAINER_NAME}" ]]; then
+      log "Removing container: ${CONTAINER_NAME}"
+      # --force handles containers still running or stuck in a
+      # Dead/Removing state, which plain 'docker rm' silently
+      # leaves behind (orphaning their overlay2 writable layer).
+      docker rm --force "${CONTAINER_NAME}" &>/dev/null || true
+   fi
+   if [[ -n "${STAGING_DIR}" ]] \
+      && [[ -d "${STAGING_DIR}" ]]; then
+      log "Removing staging directory: ${STAGING_DIR}"
+      rm --recursive --force "${STAGING_DIR}"
+   fi
+   # Clean up any leftover staging tar
+   rm --force "/tmp/debian-rootfs-full-export-$$$.tar" \
+      2>/dev/null || true
+}
+
+# ── Main ──
+
+# Main entry point: parse args, build, export, verify
+main() {
+   parse_args "$@"
+   validate_input
+   generate_container_name
+   prepare_cleanup_env
+
+   # EXIT covers normal exit and error()/exit. Explicit signal
+   # traps ensure cleanup also runs when the script is killed
+   # by Ctrl+C (INT), terminated by the system (TERM), or detached
+   # from its terminal by an SSH disconnect (HUP) — cases where
+   # the EXIT trap alone would not fire. Each signal trap exits
+   # with a conventional code, which then triggers the EXIT trap.
+   trap cleanup EXIT
+   trap 'exit 130' INT
+   trap 'exit 143' TERM
+   trap 'exit 129' HUP
+   trap 'exit 131' QUIT
+
+   # Reclaim space from any build containers left orphaned by
+   # previous runs that were interrupted before cleanup ran.
+   reap_leftover_containers
+
+   SECONDS=0
+
+   local kernel_label backports_label zfs_label pve_label refind_label strip_symlinks_label force_label
+   kernel_label="$(yn "${WITH_KERNEL}")"
+   backports_label="$(yn "${WITH_BACKPORTS}")"
+   zfs_label="$(yn "${WITH_ZFS}")"
+   pve_label="$(yn "${WITH_PVE}")"
+   refind_label="$(yn "${WITH_REFIND}")"
+   strip_symlinks_label="$(yn "${STRIP_BOOT_SYMLINKS}")"
+   force_label="$(yn "${FORCE_OVERWRITE}")"
+
+   info "Creating Debian rootfs tarball"
+   info "  Codename:      ${CODENAME}"
+   info "  Architecture:   ${ARCH}"
+   info "  Compression:    ${COMPRESSION}"
+   info "  Kernel:         ${kernel_label}"
+   info "  Backports:      ${backports_label}"
+   info "  ZFS:            ${zfs_label}"
+   info "  PVE:            ${pve_label}"
+   if [[ "${WITH_PVE}" -eq 1 ]]; then
+      info "  Strip boot symlinks: ${strip_symlinks_label}"
+   fi
+   info "  rEFInd:         ${refind_label}"
+   if [[ "${WITH_REFIND}" -eq 1 ]]; then
+      info "  ESP mount point: ${ESPROOT}"
+   fi
+   if [[ -n "${ROOT_PASSWORD}" ]]; then
+      if [[ "${ROOT_PASSWORD}" == "unlock" ]]; then
+         info "  Root password:  unlocked (no password)"
+      else
+         info "  Root password:  set"
+      fi
+   else
+      info "  Root password:  locked (default)"
+   fi
+   if [[ ${#EXTRA_PACKAGES[@]} -gt 0 ]]; then
+      info "  Extra pkgs:    ${EXTRA_PACKAGES[*]}"
+   fi
+   local default_pkg_str="${DEFAULT_PACKAGES[*]}"
+   # ifupdown is a Debian-only package (excluded for PVE builds).
+   if [[ "${WITH_PVE}" -eq 0 ]]; then
+      default_pkg_str="${default_pkg_str} ifupdown"
+   fi
+   if [[ ${#EXTRA_PACKAGES[@]} -gt 0 ]]; then
+      default_pkg_str="${default_pkg_str} ${EXTRA_PACKAGES[*]}"
+   fi
+   info "  Packages:      ${default_pkg_str}"
+   info "  Force:          ${force_label}"
+   info "  Rootfs output:  ${OUTPUT_FILE}"
+   if [[ "${WITH_KERNEL}" -eq 1 ]]; then
+      local boot_file
+      boot_file=$(get_boot_filename "${OUTPUT_FILE}")
+      info "  Boot output:    ${boot_file}"
+   fi
+   printf '\n'
+
+   create_rootfs_container
+   export_rootfs
+   verify_rootfs
+
+   printf '\n'
+   info "========================================"
+   info "  Done!"
+   info "========================================"
+
+   local elapsed
+   elapsed=$(format_elapsed_time "${SECONDS}")
+   info "  Completed in ${elapsed}"
+   printf '\n'
+
+   if [[ "${WITH_KERNEL}" -eq 1 ]]; then
+      local boot_file
+      boot_file=$(get_boot_filename "${OUTPUT_FILE}")
+      info "Output files:"
+      info "  Rootfs: ${OUTPUT_FILE}"
+      info "  Boot:   ${boot_file}"
+      printf '\n'
+      info "To deploy on a target system" \
+         "with separate / and /boot:"
+      printf '\n'
+      info "  # Unpack rootfs (excludes /boot contents)"
+      info "  mkdir --parents /mnt/rootfs"
+      info "  tar --extract --file ${OUTPUT_FILE}" \
+         "--directory /mnt/rootfs"
+      printf '\n'
+      info "  # Unpack /boot (kernel, initramfs, rEFInd) into /boot"
+      info "  mkdir --parents /mnt/rootfs/boot"
+      info "  tar --extract --file ${boot_file}" \
+         "--directory /mnt/rootfs/boot"
+      printf '\n'
+      info "  Or, for a separate /boot partition:"
+      info "  mount /dev/sdXN /mnt/rootfs/boot"
+      info "  tar --extract --file ${boot_file}" \
+         "--directory /mnt/rootfs/boot"
+      printf '\n'
+      info "To set up the EFI System Partition (ESP)" \
+         "and bootloader:"
+      info "  sudo ./setup-efi -d /dev/sda /mnt/rootfs"
+   else
+      info "Output file: ${OUTPUT_FILE}"
+      printf '\n'
+      info "To unpack on a target system:"
+      info "  mkdir --parents /mnt/rootfs"
+      info "  tar --extract --file ${OUTPUT_FILE}" \
+         "--directory /mnt/rootfs"
+      printf '\n'
+      info "NOTE: This rootfs does NOT include a Linux kernel."
+      info "Add -k (--with-kernel) to include one," \
+         "or -r (--with-refind)"
+      info "to include both kernel and rEFInd boot manager."
+      info "Add -B (--backports) for a newer kernel" \
+         "from backports."
+      info "Add -z (--with-zfs) to include ZFS support."
+      info "Add -P (--pve) to install Proxmox VE."
+   fi
+}
+
+main "$@"

@@ -1,0 +1,1027 @@
+#!/usr/bin/env bash
+#
+# test-rootfs
+#
+# Verifies a Debian rootfs tarball by unpacking it into a temporary directory
+# and checking for critical files and directories expected in a valid root
+# filesystem.
+#
+# Usage:
+#   ./test-rootfs [OPTIONS] <rootfs-tarball> [<boot-tarball>]
+#
+# The optional <boot-tarball> is auto-detected from the rootfs filename
+# when -k or -r is given and the file exists.
+#
+# Options:
+#   -k, --with-kernel   Expect kernel and initramfs in /boot
+#   -r, --with-refind   Expect rEFInd boot manager files
+#   --esproot DIR      Directory where ESP is mounted
+#                       (default: /boot/efi)
+#   -z, --with-zfs      Expect ZFS support
+#   -P, --pve           Expect a PVE installation
+#   -h, --help          Show this help message
+#
+
+set -u
+
+SCRIPT_NAME="$(basename "$0")"
+readonly SCRIPT_NAME
+TARBALL=""
+TARBALL_BOOT=""
+TEST_DIR=""
+EXPECT_KERNEL=0
+EXPECT_REFIND=0
+EXPECT_ZFS=0
+EXPECT_PVE=0
+ESPROOT="/boot/efi"
+
+# ─── Helper Functions ────────────────────────────────────────────────────────
+
+# Print usage information to stdout
+usage() {
+   cat <<-EOF
+	Usage: ${SCRIPT_NAME} [OPTIONS] <rootfs-tarball> [<boot-tarball>]
+
+	Test a Debian rootfs tarball by unpacking it and
+	verifying its structure.
+
+	Arguments:
+	  <rootfs-tarball>   Path to the rootfs tarball
+	                     (.tar, .tar.gz, or .tar.xz)
+	  <boot-tarball>    Optional path to the separate boot
+	                     tarball (auto-detected from filename
+	                     if not given)
+
+	Options:
+	  -k, --with-kernel   Expect kernel and initramfs in /boot
+	  -r, --with-refind   Expect rEFInd boot manager files
+	  --esproot DIR      Directory where ESP is mounted
+	                        (default: /boot/efi)
+	  -z, --with-zfs      Expect ZFS support
+	  -P, --pve           Expect PVE installation
+	  -h, --help          Show this help message
+
+	Examples:
+	  ${SCRIPT_NAME} debian-bookworm-rootfs.tar.gz
+	  ${SCRIPT_NAME} -k debian-bookworm-rootfs.tar.gz \\
+	    debian-bookworm-boot.tar.gz
+	  ${SCRIPT_NAME} -k -r -z debian-bookworm-rootfs.tar.gz
+	  ${SCRIPT_NAME} -P debian-bookworm-rootfs.tar.gz
+	EOF
+}
+
+# Print informational message to stdout
+info() {
+   printf '[+] %s\n' "$*"
+}
+
+# Print warning message to stderr
+warn() {
+   printf '[!] %s\n' "$*" >&2
+}
+
+# Print error message to stderr and exit with status 1
+# Parameters: $* = error message
+error() {
+   printf '[ERROR] %s\n' "$*" >&2
+   exit 1
+}
+
+# ─── Argument Parsing ─────────────────────────────────────────────────────────
+
+# Parse command-line arguments; sets TARBALL, TARBALL_BOOT, and
+# EXPECT_* globals. Exits on invalid input.
+parse_args() {
+   while [[ $# -gt 0 ]]; do
+      case "$1" in
+         -k|--with-kernel)
+            EXPECT_KERNEL=1
+            shift
+            ;;
+         -r|--with-refind)
+            EXPECT_REFIND=1
+            shift
+            ;;
+         --esproot)
+            ESPROOT="$2"
+            shift 2
+            ;;
+         -z|--with-zfs)
+            EXPECT_ZFS=1
+            shift
+            ;;
+         -P|--pve)
+            EXPECT_PVE=1
+            shift
+            ;;
+         -h|--help)
+            usage
+            exit 0
+            ;;
+         --*)
+            error "Unknown option: $1"
+            ;;
+         *)
+            if [[ -z "${TARBALL}" ]]; then
+               TARBALL="$1"
+            elif [[ -z "${TARBALL_BOOT}" ]]; then
+               TARBALL_BOOT="$1"
+            else
+               error "Unexpected argument: $1"
+            fi
+            shift
+            ;;
+      esac
+   done
+
+   if [[ -z "${TARBALL}" ]]; then
+      usage
+      exit 1
+   fi
+
+   if [[ ! -f "${TARBALL}" ]]; then
+      error "Tarball '${TARBALL}' not found."
+   fi
+
+   if [[ ! -s "${TARBALL}" ]]; then
+      error "Tarball '${TARBALL}' is empty."
+   fi
+
+   # Auto-detect boot tarball from rootfs filename
+   if [[ -z "${TARBALL_BOOT}" ]] \
+      && (( EXPECT_KERNEL == 1 || EXPECT_REFIND == 1 )); then
+      local boot_guess
+      boot_guess="${TARBALL//-rootfs./-boot.}"
+      if [[ "${boot_guess}" != "${TARBALL}" ]] \
+         && [[ -f "${boot_guess}" ]]; then
+         TARBALL_BOOT="${boot_guess}"
+         info "Auto-detected boot tarball: ${TARBALL_BOOT}"
+      fi
+   fi
+
+   if [[ -n "${TARBALL_BOOT}" ]] \
+      && [[ ! -f "${TARBALL_BOOT}" ]]; then
+      error "Boot tarball '${TARBALL_BOOT}' not found."
+   fi
+}
+
+# ─── Determine Decompression ─────────────────────────────────────────────────
+
+# Detect compression type from filename or file magic
+# Parameters: $1 = tarball path
+# Output: tar flags printed to stdout
+get_tar_flags() {
+   local tarball="$1"
+   local base
+   base="${tarball##*/}"
+
+   if [[ "$base" == *.tar.gz || "$base" == *.tgz ]]; then
+      printf '%s\n' "-xzf"
+   elif [[ "$base" == *.tar.xz ]]; then
+      printf '%s\n' "-xJf"
+   elif [[ "$base" == *.tar ]]; then
+      printf '%s\n' "-xf"
+   else
+      # Try to detect via file command
+      local filetype
+      filetype=$(file --brief "$tarball" 2>/dev/null \
+         || printf '%s' "unknown")
+      if [[ "$filetype" =~ [Gg]zip ]]; then
+         printf '%s\n' "-xzf"
+      elif [[ "$filetype" =~ [Xx]z ]]; then
+         printf '%s\n' "-xJf"
+      else
+         printf '%s\n' "-xf"
+      fi
+   fi
+}
+
+# ─── Setup & Cleanup ──────────────────────────────────────────────────────────
+
+# Create the temporary test directory
+setup() {
+   TEST_DIR=$(mktemp --directory "/tmp/debian-rootfs-test-XXXXXX")
+   info "Test directory: ${TEST_DIR}"
+}
+
+# Remove temporary test directory
+cleanup() {
+   if [[ -n "${TEST_DIR}" ]] && [[ -d "${TEST_DIR}" ]]; then
+      info "Cleaning up test directory: ${TEST_DIR}"
+      rm --recursive --force "${TEST_DIR}"
+   fi
+}
+
+# ─── Tests ────────────────────────────────────────────────────────────────────
+
+# Unpack rootfs (and optional boot) tarball into TEST_DIR
+unpack_rootfs() {
+   local tar_flags
+   tar_flags=$(get_tar_flags "${TARBALL}")
+
+   info "Unpacking rootfs tarball with flags: ${tar_flags}"
+   tar "${tar_flags}" "${TARBALL}" -C "${TEST_DIR}"
+
+   # Unpack boot tarball if provided
+   if [[ -n "${TARBALL_BOOT}" ]]; then
+      local boot_flags
+      boot_flags=$(get_tar_flags "${TARBALL_BOOT}")
+      info "Unpacking boot tarball with flags: ${boot_flags}"
+      tar "${boot_flags}" "${TARBALL_BOOT}" -C "${TEST_DIR}/boot"
+   fi
+
+   local file_count
+   file_count=$(find "${TEST_DIR}" -type f | wc --lines)
+   info "Unpacked ${file_count} files"
+}
+
+# Check that critical top-level directories exist
+# Returns: 0 if all present, 1 if any missing
+check_critical_dirs() {
+   info "Checking critical directories..."
+
+   local dirs=(
+      "bin"
+      "etc"
+      "lib"
+      "usr"
+      "var"
+      "proc"
+      "sys"
+      "dev"
+      "run"
+      "boot"
+   )
+
+   local missing=0
+   local dir
+   for dir in "${dirs[@]}"; do
+      local path="${TEST_DIR}/${dir}"
+      if [[ -d "$path" ]]; then
+         info "  ✓ /${dir} exists"
+      else
+         warn "  ✗ /${dir} is MISSING"
+         missing=1
+      fi
+   done
+
+   return "${missing}"
+}
+
+# Check that critical binaries and config files exist
+# Returns: 0 if all present, 1 if any missing
+check_critical_files() {
+   info "Checking critical files..."
+
+   local files=(
+      "bin/sh"
+      "bin/cat"
+      "bin/ls"
+      "bin/bash"
+      "bin/ping"
+      "etc/passwd"
+      "etc/group"
+      "etc/shadow"
+      "etc/fstab"
+      "etc/os-release"
+      "etc/debian_version"
+      "usr/sbin/sshd"
+      "usr/bin/ssh"
+   )
+
+   local missing=0
+   local file
+   for file in "${files[@]}"; do
+      local path="${TEST_DIR}/${file}"
+      if [[ -e "$path" ]]; then
+         info "  ✓ /${file} exists"
+      else
+         warn "  ✗ /${file} is MISSING"
+         missing=1
+      fi
+   done
+
+   return "${missing}"
+}
+
+# Check that kernel and initramfs exist in /boot
+# Returns: 0 if found, 1 if missing
+check_kernel() {
+   info "Checking for Linux kernel in /boot..."
+
+   local missing=0
+   local kernel_count
+   kernel_count=$(find "${TEST_DIR}/boot" \
+      -name "vmlinuz-*" -type f 2>/dev/null | wc --lines)
+
+   if (( kernel_count > 0 )); then
+      local kernel
+      kernel=$(find "${TEST_DIR}/boot" \
+         -name "vmlinuz-*" -type f 2>/dev/null \
+         | sort --version-sort | tail --lines=1)
+      local kernel_name="${kernel##*/}"
+      info "  ✓ Found kernel: ${kernel_name}"
+   else
+      warn "  ✗ No kernel image found in /boot"
+      missing=1
+   fi
+
+   # Check for initramfs
+   local initrd_count
+   initrd_count=$(find "${TEST_DIR}/boot" \
+      \( -name "initrd.img-*" -o -name "initramfs-*" \) \
+      -type f 2>/dev/null | wc --lines)
+
+   if (( initrd_count > 0 )); then
+      local initrd
+      initrd=$(find "${TEST_DIR}/boot" \
+         \( -name "initrd.img-*" -o -name "initramfs-*" \) \
+         -type f 2>/dev/null \
+         | sort --version-sort | tail --lines=1)
+      local initrd_name="${initrd##*/}"
+      info "  ✓ Found initrd: ${initrd_name}"
+   else
+      warn "  ✗ No initramfs found in /boot"
+      missing=1
+   fi
+
+   return "${missing}"
+}
+
+# Check that rEFInd boot manager files are present
+# Returns: 0 if found, 1 if missing
+check_refind() {
+   info "Checking for rEFInd boot manager..."
+
+   local missing=0
+
+   # Check for rEFInd files in ${ESPROOT}/EFI/refind
+   # or /usr/share/refind/refind
+   local refind_boot="${TEST_DIR}${ESPROOT}/EFI/refind"
+   local refind_share="${TEST_DIR}/usr/share/refind/refind"
+
+   if [[ -d "$refind_boot" ]]; then
+      info "  ✓ rEFInd directory exists: ${ESPROOT}/EFI/refind"
+
+      # Check for EFI binary
+      local efi_binary
+      efi_binary=$(find "$refind_boot" \
+         -name "refind_*.efi" -type f 2>/dev/null \
+         | head --lines=1)
+      if [[ -n "$efi_binary" ]]; then
+         local efi_name="${efi_binary##*/}"
+         info "  ✓ Found rEFInd binary: ${efi_name}"
+      else
+         warn "  ✗ No rEFInd EFI binary in ${ESPROOT}/EFI/refind"
+         missing=1
+      fi
+
+      # Check for config
+      if [[ -f "$refind_boot/refind.conf" ]]; then
+         info "  ✓ rEFInd config exists"
+      else
+         warn "  ✗ No rEFInd config file found"
+         missing=1
+      fi
+
+      # Check for icons
+      if [[ -d "$refind_boot/icons" ]]; then
+         info "  ✓ rEFInd icons directory exists"
+      else
+         warn "  ✗ No rEFInd icons directory"
+         missing=1
+      fi
+
+   elif [[ -d "$refind_share" ]]; then
+      info "  ✓ rEFInd package files in /usr/share/refind/refind"
+      local efi_binary
+      efi_binary=$(find "$refind_share" \
+         -name "refind_*.efi" -type f 2>/dev/null \
+         | head --lines=1)
+      if [[ -n "$efi_binary" ]]; then
+         local efi_name="${efi_binary##*/}"
+         info "  ✓ Found rEFInd binary: ${efi_name}"
+      else
+         warn "  ✗ No rEFInd EFI binary found"
+         missing=1
+      fi
+
+   else
+      warn "  ✗ No rEFInd files found in rootfs"
+      missing=1
+   fi
+
+   return "${missing}"
+}
+
+# Check that Docker artifacts have been removed
+# Returns: 0 if all removed, 1 if any remain
+check_no_docker_artifacts() {
+   info "Checking for Docker artifacts (should be removed)..."
+
+   local artifacts=(
+      ".dockerenv"
+      "Dockerfile"
+   )
+
+   local found=0
+   local artifact
+   for artifact in "${artifacts[@]}"; do
+      local path="${TEST_DIR}/${artifact}"
+      if [[ -e "$path" ]]; then
+         warn "  ✗ /${artifact} still exists (should be removed)"
+         found=1
+      else
+         info "  ✓ /${artifact} removed"
+      fi
+   done
+
+   return "${found}"
+}
+
+# Check that apt cache has been cleaned
+# Returns: 0 always (informational)
+check_no_apt_cache() {
+   info "Checking apt cache is cleaned..."
+
+   local apt_cache="${TEST_DIR}/var/cache/apt/archives"
+   local deb_count=0
+   if [[ -d "$apt_cache" ]]; then
+      deb_count=$(find "$apt_cache" -name "*.deb" 2>/dev/null \
+         | wc --lines)
+   fi
+
+   if (( deb_count == 0 )); then
+      info "  ✓ No .deb files in apt cache"
+   else
+      warn "  ✗ Found ${deb_count} .deb files in apt cache"
+      warn "    (should have been cleaned)"
+   fi
+
+   return 0
+}
+
+# Check file ownership and permissions from tar headers
+# Returns: 0 if OK, 1 for each failure
+check_ownership_and_permissions() {
+   info "Checking ownership and permissions" \
+      "(from tar headers)..."
+
+   local failures=0
+
+   # Read ownership/permissions from tar headers rather
+   # than filesystem (ownership only preserved when
+   # extracting as root).
+   local tar_listing
+   tar_listing=$(mktemp "/tmp/test-ownership-XXXXXX")
+   local rootfs_tar="${TARBALL}"
+   local list_flag
+   if [[ "$rootfs_tar" == *.tar.gz || "$rootfs_tar" == *.tgz ]]; then
+      list_flag="-tzvf"
+   elif [[ "$rootfs_tar" == *.tar.xz ]]; then
+      list_flag="-tJvf"
+   else
+      list_flag="-tvf"
+   fi
+   tar "${list_flag}" "$rootfs_tar" \
+      > "$tar_listing" 2>/dev/null \
+      || true
+
+   # ─── Ownership checks from tar headers ───
+
+   # /etc/shadow: expect root:shadow (0/42) or root:root (0/0)
+   local shadow_line
+   shadow_line=$(grep --extended-regexp "etc/shadow$" \
+      "$tar_listing" | head --lines=1 || true)
+   if [[ -n "$shadow_line" ]]; then
+      local shadow_owner
+      shadow_owner=$(printf '%s' "$shadow_line" | awk '{print $2}')
+      if [[ "$shadow_owner" == "0/42" \
+         || "$shadow_owner" == "0/0" ]]; then
+         info "  ✓ /etc/shadow ownership: ${shadow_owner}"
+      else
+         warn "  ✗ /etc/shadow ownership: ${shadow_owner}"
+         warn "    (expected 0/42 or 0/0)"
+         failures=$((failures + 1))
+      fi
+
+      # Check permissions: rw-r----- (640)
+      local shadow_perm
+      shadow_perm=$(printf '%s' "$shadow_line" \
+         | awk '{print $1}' | cut --characters=2-10)
+      if [[ "$shadow_perm" == "rw-r-----" ]]; then
+         info "  ✓ /etc/shadow permissions: ${shadow_perm}"
+      else
+         warn "  ✗ /etc/shadow permissions: ${shadow_perm}"
+         warn "    (expected rw-r-----)"
+         failures=$((failures + 1))
+      fi
+   else
+      warn "  ✗ /etc/shadow not found in tar listing"
+      failures=$((failures + 1))
+   fi
+
+   # /etc/passwd: expect 644 root:root
+   local passwd_line
+   passwd_line=$(grep --extended-regexp "etc/passwd$" \
+      "$tar_listing" | head --lines=1 || true)
+   if [[ -n "$passwd_line" ]]; then
+      local passwd_owner passwd_perm
+      passwd_owner=$(printf '%s' "$passwd_line" | awk '{print $2}')
+      passwd_perm=$(printf '%s' "$passwd_line" \
+         | awk '{print $1}' | cut --characters=2-10)
+      if [[ "$passwd_owner" == "0/0" ]]; then
+         info "  ✓ /etc/passwd ownership: ${passwd_owner}"
+      else
+         warn "  ✗ /etc/passwd ownership: ${passwd_owner}"
+         warn "    (expected 0/0)"
+         failures=$((failures + 1))
+      fi
+      if [[ "$passwd_perm" == "rw-r--r--" ]]; then
+         info "  ✓ /etc/passwd permissions: ${passwd_perm}"
+      else
+         warn "  ✗ /etc/passwd permissions: ${passwd_perm}"
+         warn "    (expected rw-r--r--)"
+         failures=$((failures + 1))
+      fi
+   fi
+
+   # ─── setuid/setgid/sticky bit checks ───
+   info "Checking setuid/setgid/sticky bits" \
+      "(from tar headers)..."
+
+   # Check /usr/bin/su is setuid
+   local su_line
+   su_line=$(grep --extended-regexp "usr/bin/su$" \
+      "$tar_listing" | head --lines=1 || true)
+   if [[ -z "$su_line" ]]; then
+      su_line=$(grep --extended-regexp "bin/su$" \
+         "$tar_listing" | head --lines=1 || true)
+   fi
+   if [[ -n "$su_line" ]]; then
+      local su_perm
+      su_perm=$(printf '%s' "$su_line" \
+         | awk '{print $1}' | cut --characters=2-10)
+      if [[ "$su_perm" == "rwsr-xr-x" ]]; then
+         info "  ✓ /usr/bin/su is setuid (rwsr-xr-x)"
+      else
+         warn "  ✗ /usr/bin/su has permissions ${su_perm}"
+         warn "    (expected rwsr-xr-x setuid)"
+         failures=$((failures + 1))
+      fi
+   fi
+
+   # Check /tmp has sticky bit
+   local tmp_line
+   tmp_line=$(grep --extended-regexp '^d.*[^/]tmp/?$' \
+      "$tar_listing" | head --lines=1 || true)
+   if [[ -n "$tmp_line" ]]; then
+      local tmp_perm
+      tmp_perm=$(printf '%s' "$tmp_line" \
+         | awk '{print $1}' | cut --characters=2-10)
+      if [[ "$tmp_perm" == "rwxrwxrwt" ]]; then
+         info "  ✓ /tmp has sticky bit (rwxrwxrwt)"
+      else
+         warn "  ✗ /tmp has permissions ${tmp_perm}"
+         warn "    (expected rwxrwxrwt with sticky bit)"
+         failures=$((failures + 1))
+      fi
+   fi
+
+   # Count setuid files in tar
+   local setuid_count
+   setuid_count=$(awk 'substr($1,4,1) ~ /[sS]/' \
+      "$tar_listing" 2>/dev/null | wc --lines)
+   setuid_count="${setuid_count//[[:space:]]/}"
+   setuid_count="${setuid_count:-0}"
+   if (( setuid_count >= 1 )); then
+      info "  ✓ Found ${setuid_count} setuid file(s)" \
+         "in tar headers"
+   else
+      warn "  ✗ No setuid files found in tar"
+      warn "    (expected su, passwd, etc.)"
+      failures=$((failures + 1))
+   fi
+
+   # Count setgid files
+   local setgid_count
+   setgid_count=$(awk 'substr($1,7,1) ~ /[sS]/' \
+      "$tar_listing" 2>/dev/null | wc --lines)
+   setgid_count="${setgid_count//[[:space:]]/}"
+   setgid_count="${setgid_count:-0}"
+   if (( setgid_count >= 1 )); then
+      info "  ✓ Found ${setgid_count} setgid file(s)" \
+         "in tar headers"
+   fi
+
+   # ─── Ownership diversity check ───
+   local unique_owners
+   unique_owners=$(awk '{print $2}' "$tar_listing" \
+      | cut --delimiter=/ --fields=1 \
+      | sort --unique | wc --lines)
+   if (( unique_owners >= 2 )); then
+      info "  ✓ Multiple distinct UIDs in tar"
+      info "    (ownership preserved from container)"
+   else
+      local has_root
+      has_root=$(awk '{print $2}' "$tar_listing" \
+         | cut --delimiter=/ --fields=1 \
+         | sort --unique \
+         | grep --count --extended-regexp '^0$' \
+         || printf '%s' "0")
+      if (( has_root >= 1 )); then
+         info "  ✓ Root (uid 0) present in tar ownership"
+      else
+         warn "  ✗ All files have same UID"
+         warn "    (ownership may not be preserved)"
+         failures=$((failures + 1))
+      fi
+   fi
+
+   # Also check boot tarball ownership if present
+   if [[ -n "${TARBALL_BOOT}" ]] \
+      && [[ -f "${TARBALL_BOOT}" ]]; then
+      info "Checking boot tarball ownership..."
+      local boot_list_flag
+      if [[ "${TARBALL_BOOT}" == *.tar.gz ]] \
+         || [[ "${TARBALL_BOOT}" == *.tgz ]]; then
+         boot_list_flag="-tzvf"
+      elif [[ "${TARBALL_BOOT}" == *.tar.xz ]]; then
+         boot_list_flag="-tJvf"
+      else
+         boot_list_flag="-tvf"
+      fi
+      local boot_listing
+      boot_listing=$(mktemp "/tmp/test-boot-ownership-XXXXXX")
+      tar "${boot_list_flag}" "${TARBALL_BOOT}" \
+         > "$boot_listing" 2>/dev/null || true
+
+      local boot_non_root
+      boot_non_root=$(awk '{print $2}' "$boot_listing" \
+         | cut --delimiter=/ --fields=1 \
+         | grep --count --invert-match \
+            --extended-regexp '^0$' \
+         || printf '%s' "0")
+      boot_non_root="${boot_non_root//[[:space:]]/}"
+      boot_non_root="${boot_non_root:-0}"
+      if (( boot_non_root == 0 )); then
+         info "  ✓ All boot entries owned by root (0/*)"
+      else
+         warn "  ✗ ${boot_non_root} boot entries" \
+            "not owned by root"
+         failures=$((failures + 1))
+      fi
+      rm --force "$boot_listing"
+   fi
+
+   rm --force "$tar_listing"
+   return "${failures}"
+}
+
+# Check that machine-id is empty or absent
+# Returns: 0 always (informational)
+check_no_machine_id() {
+   info "Checking machine-id is empty..."
+
+   local machine_id="${TEST_DIR}/etc/machine-id"
+   if [[ -f "$machine_id" ]]; then
+      local size
+      size=$(stat --format=%s "$machine_id" 2>/dev/null \
+         || stat -f%z "$machine_id" 2>/dev/null \
+         || printf '%s' "unknown")
+      if (( size == 0 )); then
+         info "  ✓ /etc/machine-id is empty"
+         info "    (will be regenerated on first boot)"
+      else
+         warn "  ✗ /etc/machine-id is not empty"
+         warn "    (${size} bytes — should be truncated)"
+      fi
+   else
+      info "  ✓ /etc/machine-id does not exist"
+   fi
+
+   return 0
+}
+
+# Check OS release information identifies as Debian
+# Returns: 0 always (informational)
+check_os_release() {
+   info "Checking OS release information..."
+
+   local os_release="${TEST_DIR}/etc/os-release"
+   if [[ -f "$os_release" ]]; then
+      if grep --quiet --ignore-case "debian" "$os_release"; then
+         info "  ✓ os-release contains 'Debian'"
+         local version codename
+         version=$(grep "^VERSION=" "$os_release" 2>/dev/null \
+            | head --lines=1 || true)
+         codename=$(grep "^VERSION_CODENAME=" \
+            "$os_release" 2>/dev/null \
+            | head --lines=1 || true)
+         [[ -n "$version" ]] && info "    ${version}"
+         [[ -n "$codename" ]] && info "    ${codename}"
+      else
+         warn "  ✗ os-release does not contain 'Debian'"
+      fi
+   else
+      warn "  ✗ /etc/os-release is missing"
+   fi
+
+   return 0
+}
+
+# Check for ZFS support (userland, kernel module, initramfs)
+# Returns: 0 if all found, 1 if any missing
+check_zfs() {
+   info "Checking ZFS support..."
+
+   local missing=0
+
+   # Check for ZFS userland tools
+   if [[ -x "${TEST_DIR}/usr/sbin/zfs" ]]; then
+      info "  ✓ /usr/sbin/zfs exists"
+   else
+      warn "  ✗ /usr/sbin/zfs not found"
+      missing=1
+   fi
+
+   if [[ -x "${TEST_DIR}/usr/sbin/zpool" ]]; then
+      info "  ✓ /usr/sbin/zpool exists"
+   else
+      warn "  ✗ /usr/sbin/zpool not found"
+      missing=1
+   fi
+
+   # Check for ZFS DKMS module source (use globs, not ls)
+   if compgen -G "${TEST_DIR}/usr/lib/modules/*/updates/dkms/zfs.ko*" >/dev/null; then
+      info "  ✓ ZFS kernel module found"
+   elif compgen -G "${TEST_DIR}/usr/src/zfs-*" >/dev/null; then
+      info "  ✓ ZFS DKMS source present"
+   else
+      warn "  ✗ ZFS kernel module/source not found"
+      missing=1
+   fi
+
+   # Check for ZFS initramfs hook
+   if [[ -f "${TEST_DIR}/usr/share/initramfs-tools/hooks/zfs" ]] \
+      || [[ -d "${TEST_DIR}/etc/zfs" ]]; then
+      info "  ✓ ZFS initramfs integration present"
+   else
+      warn "  ✗ ZFS initramfs hook not found"
+      missing=1
+   fi
+
+   # Check for zfs-zed (ZFS Event Daemon)
+   if [[ -x "${TEST_DIR}/usr/sbin/zed" ]] \
+      || [[ -x "${TEST_DIR}/usr/lib/zfs-linux/zed" ]]; then
+      info "  ✓ ZFS Event Daemon present"
+   else
+      warn "  ✗ ZFS Event Daemon not found"
+      missing=1
+   fi
+
+   return "${missing}"
+}
+
+# Check for PVE installation
+# Returns: 0 if all checks pass, 1 for each failure
+check_pve() {
+   info "Checking PVE installation..."
+
+   local missing=0
+
+   # Check for PVE kernel in /boot
+   local pve_kernel_count
+   pve_kernel_count=$(find "${TEST_DIR}/boot" \
+      -name "vmlinuz-*-pve" -type f 2>/dev/null | wc --lines)
+   if (( pve_kernel_count > 0 )); then
+      local pve_kernel
+      pve_kernel=$(find "${TEST_DIR}/boot" \
+         -name "vmlinuz-*-pve" -type f 2>/dev/null \
+         | sort --version-sort | tail --lines=1)
+      local pve_kernel_name="${pve_kernel##*/}"
+      info "  ✓ Found PVE kernel: ${pve_kernel_name}"
+   else
+      warn "  ✗ No PVE kernel found in /boot" \
+         "(expected vmlinuz-*-pve)"
+      missing=1
+   fi
+
+   # Check that no standard Debian kernel remains
+   local std_kernel_count
+   std_kernel_count=$(find "${TEST_DIR}/boot" \
+      -name "vmlinuz-*" -type f 2>/dev/null \
+      | grep --invert-match --count -- '-pve' || true)
+   if (( std_kernel_count == 0 )); then
+      info "  ✓ No standard Debian kernel in /boot" \
+         "(correctly removed)"
+   else
+      warn "  ✗ Found ${std_kernel_count} non-PVE" \
+         "kernel(s) in /boot"
+      missing=1
+   fi
+
+   # Check for PVE management tools
+   if [[ -x "${TEST_DIR}/usr/bin/pvectl" ]] \
+      || [[ -x "${TEST_DIR}/usr/bin/pvesh" ]] \
+      || [[ -d "${TEST_DIR}/usr/share/pve-manager" ]]; then
+      info "  ✓ PVE management tools present"
+   else
+      warn "  ✗ PVE management tools not found"
+      missing=1
+   fi
+
+   # Check for pve-manager
+   if [[ -d "${TEST_DIR}/usr/share/pve-manager" ]]; then
+      info "  ✓ pve-manager package installed"
+   else
+      warn "  ✗ pve-manager package not found"
+      missing=1
+   fi
+
+   # Check PVE repository is configured
+   local repo_found=0
+   if [[ -f "${TEST_DIR}/etc/apt/sources.list.d/pve-install-repo.sources" ]]; then
+      info "  ✓ PVE repository configured (deb822 format)"
+      repo_found=1
+   fi
+   if [[ -f "${TEST_DIR}/etc/apt/sources.list.d/pve-install-repo.list" ]]; then
+      info "  ✓ PVE repository configured (legacy format)"
+      repo_found=1
+   fi
+   if (( repo_found == 0 )); then
+      warn "  ✗ PVE repository not found" \
+         "in /etc/apt/sources.list.d/"
+      missing=1
+   fi
+
+   # Check that os-prober is NOT installed
+   if [[ -d "${TEST_DIR}/usr/share/os-prober" ]]; then
+      warn "  ✗ os-prober still installed (should be removed)"
+      missing=1
+   else
+      info "  ✓ os-prober removed (correctly)"
+   fi
+
+   # Check that enterprise repository is disabled
+   # (proxmox-ve creates it automatically, but without
+   # a subscription key apt update would fail)
+   local enterprise_list
+   enterprise_list="${TEST_DIR}/etc/apt/sources.list.d/pve-enterprise.list"
+   local enterprise_sources
+   enterprise_sources="${TEST_DIR}/etc/apt/sources.list.d/pve-enterprise.sources"
+   if [[ -f "$enterprise_list" ]] \
+      || [[ -f "$enterprise_sources" ]]; then
+      warn "  ✗ Enterprise repository still enabled" \
+         "(should be disabled without a subscription key)"
+      missing=1
+   elif [[ -f "${enterprise_list}.disabled" ]] \
+      || [[ -f "${enterprise_sources}.disabled" ]]; then
+      info "  ✓ Enterprise repository correctly disabled"
+   else
+      info "  ✓ Enterprise repository not present" \
+         "(correctly not created)"
+   fi
+
+   # Check ZFS tools are available (PVE kernel includes ZFS)
+   if [[ -x "${TEST_DIR}/usr/sbin/zfs" ]] \
+      || [[ -x "${TEST_DIR}/usr/bin/zfs" ]]; then
+      info "  ✓ ZFS userland tools available (from PVE repo)"
+   else
+      warn "  ✗ ZFS userland tools not found" \
+         "(should be installed from PVE repo)"
+      missing=1
+   fi
+
+   # Check for postfix (required by PVE)
+   if [[ -x "${TEST_DIR}/usr/sbin/postfix" ]] \
+      || [[ -d "${TEST_DIR}/etc/postfix" ]]; then
+      info "  ✓ postfix present (required by PVE)"
+   else
+      warn "  ✗ postfix not found (required by PVE)"
+      missing=1
+   fi
+
+   # Check for open-iscsi (required by PVE)
+   if [[ -x "${TEST_DIR}/usr/sbin/iscsid" ]] \
+      || [[ -d "${TEST_DIR}/etc/iscsi" ]]; then
+      info "  ✓ open-iscsi present (required by PVE)"
+   else
+      warn "  ✗ open-iscsi not found (required by PVE)"
+      missing=1
+   fi
+
+   # Check for chrony (recommended by PVE)
+   if [[ -x "${TEST_DIR}/usr/sbin/chronyd" ]] \
+      || [[ -x "${TEST_DIR}/usr/bin/chronyc" ]]; then
+      info "  ✓ chrony present (recommended by PVE)"
+   else
+      warn "  ✗ chrony not found (recommended by PVE)"
+   fi
+
+   return "${missing}"
+}
+
+# Print test summary with tarball info and next steps
+print_summary() {
+   printf '\n'
+   info "════════════════════════════════"
+   info "  Test Summary"
+   info "════════════════════════════════"
+
+   local tarball_size
+   tarball_size=$(du --human-readable "${TARBALL}" \
+      | cut --fields=1)
+   local rootfs_size
+   rootfs_size=$(du --summarize --human-readable "${TEST_DIR}" \
+      | cut --fields=1)
+
+   info "  Tarball:       ${TARBALL}"
+   info "  Tarball size:  ${tarball_size}"
+   info "  Unpacked size: ${rootfs_size}"
+   printf '\n'
+   info "  To use this rootfs on a target system:"
+   info "    mkdir --parents /mnt/rootfs"
+   info "    tar --extract --file ${TARBALL}" \
+      "--directory /mnt/rootfs"
+
+   if (( EXPECT_KERNEL == 1 )); then
+      printf '\n'
+      info "  To set up EFI boot with rEFInd" \
+         "(if included):"
+      info "    sudo ./setup-efi -d /dev/sda /mnt/rootfs"
+   fi
+   printf '\n'
+}
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
+# Main entry point: parse args, run all checks, report results
+main() {
+   parse_args "$@"
+   setup
+   trap cleanup EXIT
+
+   info "Testing rootfs tarball: ${TARBALL}"
+   printf '\n'
+
+   unpack_rootfs
+   printf '\n'
+
+   local failures=0
+
+   check_critical_dirs  || failures=$((failures + 1))
+   printf '\n'
+
+   check_critical_files || failures=$((failures + 1))
+   printf '\n'
+
+   check_no_docker_artifacts || failures=$((failures + 1))
+   printf '\n'
+
+   check_no_apt_cache
+   printf '\n'
+
+   check_ownership_and_permissions \
+      || failures=$((failures + 1))
+   printf '\n'
+
+   check_no_machine_id
+   printf '\n'
+
+   check_os_release
+   printf '\n'
+
+   # Optional checks
+   if (( EXPECT_KERNEL == 1 )); then
+      check_kernel || failures=$((failures + 1))
+      printf '\n'
+   fi
+
+   if (( EXPECT_REFIND == 1 )); then
+      check_refind || failures=$((failures + 1))
+      printf '\n'
+   fi
+
+   if (( EXPECT_ZFS == 1 )); then
+      check_zfs || failures=$((failures + 1))
+      printf '\n'
+   fi
+
+   if (( EXPECT_PVE == 1 )); then
+      check_pve || failures=$((failures + 1))
+      printf '\n'
+   fi
+
+   print_summary
+
+   if (( failures == 0 )); then
+      info "All tests PASSED ✓"
+      exit 0
+   else
+      warn "Some tests FAILED (see above for details)"
+      exit 1
+   fi
+}
+
+main "$@"
