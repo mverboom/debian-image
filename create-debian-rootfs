@@ -1269,6 +1269,82 @@ reap_leftover_containers() {
    done
 }
 
+# Reclaim space from overlay2 mounts Docker has lost track of.
+#
+# Complements reap_leftover_containers: that one reaps containers
+# Docker still knows about (by name). This one targets the worse
+# case -- a `--rm`/`docker rm` that dropped the container metadata
+# but failed to unmount its writable overlay, leaving the
+# multi-gigabyte apt-installed rootfs pinned and mounted under
+# /var/lib/docker/overlay2 forever. `docker system prune` cannot
+# reclaim these because Docker no longer knows about the container.
+#
+# It finds overlay2 `.../<id>/merged` mounts still mounted in the
+# kernel whose `<id>` is NOT the writable layer of any container
+# Docker knows about (per `docker ps -a` + inspect), unmounts
+# `merged`, and removes the `<id>` dir and its `<id>-init` sibling.
+# Image layers are never mounted as a standalone `merged` overlay, so
+# base images such as debian:suite can never be touched. Containers
+# Docker still tracks are skipped. The `l/` symlink namespace is
+# never touched. Safe to call repeatedly and while the daemon runs.
+# Only operates when the storage driver is overlay2.
+docker_scrub_orphaned_overlays() {
+   local driver root overlay_dir
+   driver="$(docker info -f '{{.Driver}}' 2>/dev/null)"
+   [[ "${driver}" == "overlay2" ]] || return 0
+   root="$(docker info -f '{{.DockerRootDir}}' 2>/dev/null)"
+   [[ -n "${root}" ]] || return 0
+   overlay_dir="${root}/overlay2"
+   [[ -d "${overlay_dir}" ]] || return 0
+
+   # Set of overlay2 upperdir basenames Docker currently knows about
+   # (every container, running or stopped). These must never be touched.
+   declare -A known=()
+   local id upper
+   while IFS= read -r id; do
+      [[ -n "${id}" ]] || continue
+      upper="$(docker inspect -f '{{.GraphDriver.Data.UpperDir}}' "${id}" 2>/dev/null)" || continue
+      [[ -n "${upper}" ]] || continue
+      case "${upper}" in
+         "${overlay_dir}/"*) known["$(basename "${upper}")"]=1 ;;
+      esac
+   done < <(docker ps -aq 2>/dev/null)
+
+   # Scan active overlay mounts. A `merged` mount whose upperdir id
+   # is not in `known` is a leaked mount from a forgotten container.
+   local line mp cid dir removed=0 skipped=0
+   while IFS= read -r line; do
+      # line: "overlay on /var/lib/docker/overlay2/<id>/merged type overlay ..."
+      mp="${line#overlay on }"
+      mp="${mp%% type *}"
+      case "${mp}" in
+         "${overlay_dir}/"*) ;;
+         *) continue ;;
+      esac
+      cid="$(basename "$(dirname "${mp}")")"   # <id> from .../<id>/merged
+      [[ -n "${cid}" ]] || continue
+      if [[ -n "${known[${cid}]:-}" ]]; then
+         continue            # Docker still tracks this container; leave it.
+      fi
+      log "Removing leaked overlay mount: ${cid}"
+      umount "${mp}" 2>/dev/null || umount -l "${mp}" 2>/dev/null || true
+      # --one-file-system refuses to cross a still-mounted overlay.
+      for dir in "${overlay_dir}/${cid}" "${overlay_dir}/${cid}-init"; do
+         [[ -e "${dir}" ]] || continue
+         if rm -rf --one-file-system "${dir}" 2>/dev/null; then
+            removed=$(( removed + 1 ))
+         else
+            warn "Could not remove orphaned overlay dir: $(basename "${dir}")"
+            skipped=$(( skipped + 1 ))
+         fi
+      done
+   done < <(mount 2>/dev/null | grep ' type overlay ')
+
+   if (( removed > 0 || skipped > 0 )); then
+      log "Overlay scrub: removed ${removed} dir(s), skipped ${skipped}"
+   fi
+}
+
 # Clean up Docker container and temporary files
 cleanup() {
    if [[ -n "${CONTAINER_NAME}" ]]; then
@@ -1312,6 +1388,9 @@ main() {
    # Reclaim space from any build containers left orphaned by
    # previous runs that were interrupted before cleanup ran.
    reap_leftover_containers
+   # Also reclaim overlay mounts Docker has entirely forgotten about
+   # (metadata gone but the writable layer still mounted).
+   docker_scrub_orphaned_overlays
 
    SECONDS=0
 
