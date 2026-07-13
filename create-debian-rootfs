@@ -1362,6 +1362,11 @@ cleanup() {
    # Clean up any leftover staging tar
    rm --force "/tmp/debian-rootfs-full-export-$$$.tar" \
       2>/dev/null || true
+   # Reclaim any overlay2 mount Docker just forgot (rm above dropped
+   # the container metadata but may have failed to unmount its
+   # writable layer). Mount-based and conservative; image layers and
+   # tracked containers are never touched.
+   docker_scrub_orphaned_overlays
 }
 
 # ── Main ──
