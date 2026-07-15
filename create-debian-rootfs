@@ -87,6 +87,9 @@ readonly -a DEFAULT_PACKAGES=(
    "vim"
    "lsb-release"
    "gnupg"
+   "cryptsetup"
+   "cryptsetup-initramfs"
+   "keyutils"
 )
 
 # Map architecture to Debian kernel package suffix
