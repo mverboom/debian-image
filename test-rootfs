@@ -419,9 +419,18 @@ check_refind() {
 check_no_docker_artifacts() {
    info "Checking for Docker artifacts (should be removed)..."
 
+   # Every file here is shipped by the official debian:<codename>
+   # Docker image and is inappropriate for a real, bootable system.
+   # See _cleanup for what each one does and why it must be stripped.
    local artifacts=(
       ".dockerenv"
       "Dockerfile"
+      "usr/sbin/policy-rc.d"
+      "etc/apt/apt.conf.d/docker-autoremove-suggests"
+      "etc/apt/apt.conf.d/docker-clean"
+      "etc/apt/apt.conf.d/docker-gzip-indexes"
+      "etc/apt/apt.conf.d/docker-no-languages"
+      "etc/dpkg/dpkg.cfg.d/docker-apt-speedup"
    )
 
    local found=0

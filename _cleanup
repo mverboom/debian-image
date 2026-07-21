@@ -345,9 +345,42 @@ main() {
    fi
 
    # ── Remove Docker-specific artifacts ──
+   # The official debian:<codename> Docker images ship several
+   # container-oriented files that must NOT survive into a tarball
+   # meant for a real, bootable system. They are removed here, AFTER
+   # all apt installs are done, so the Docker apt/dpkg configs
+   # (force-unsafe-io, compressed indexes, no translations, …) still
+   # speed up the in-container build but never reach the target.
+   #
+   #   /.dockerenv, /Dockerfile, /.dockerinit
+   #       Marker files proving "we are in a container".
+   #   /usr/sbin/policy-rc.d   (exit 101)
+   #       Tells apt to never start/restart/stop services. On a real
+   #       system this silently breaks every service managed by apt
+   #       triggers (sshd, networking, PVE daemons, …).
+   #   /etc/apt/apt.conf.d/docker-*
+   #       docker-clean              — wipes apt cache after every
+   #                                   dpkg/apt invoke (layer-size
+   #                                   optimization, not wanted on a
+   #                                   real system).
+   #       docker-no-languages       — Acquire::Languages "none"
+   #                                   (suppresses translation files).
+   #       docker-gzip-indexes       — Acquire::GzipIndexes "true"
+   #                                   (keeps apt lists compressed).
+   #       docker-autoremove-suggests — changes autoremove behavior.
+   #   /etc/dpkg/dpkg.cfg.d/docker-apt-speedup
+   #       force-unsafe-io — skips fsync()s; faster in a throwaway
+   #       build layer but risks data corruption on a real machine
+   #       subject to power loss.
    rm --force /.dockerenv || true
    rm --force /Dockerfile || true
    rm --recursive --force /.dockerinit || true
+   rm --force /usr/sbin/policy-rc.d || true
+   rm --force /etc/apt/apt.conf.d/docker-autoremove-suggests || true
+   rm --force /etc/apt/apt.conf.d/docker-clean || true
+   rm --force /etc/apt/apt.conf.d/docker-gzip-indexes || true
+   rm --force /etc/apt/apt.conf.d/docker-no-languages || true
+   rm --force /etc/dpkg/dpkg.cfg.d/docker-apt-speedup || true
 
    # ── Clean apt cache and lists ──
    apt-get clean 2>/dev/null || true

@@ -5,7 +5,7 @@ root filesystems** from a tarball. The rootfs is produced inside a Docker
 container, exported as a (split) tar archive, optionally tested, and then
 unpacked onto a target disk and made bootable with the rEFInd boot manager.
 
-The toolkit is made of four bash scripts:
+The toolkit is made of five bash scripts:
 
 | Script | Purpose | Runs where |
 | --- | --- | --- |
@@ -13,6 +13,7 @@ The toolkit is made of four bash scripts:
 | `_cleanup` | Configure & clean the rootfs *inside* the container | Inside the container (bind-mounted, not run directly) |
 | `test-rootfs` | Verify a produced tarball has the expected structure/files | Host |
 | `setup-efi` | Set up the ESP and install rEFInd on a target disk | Host (needs root) |
+| `purge-docker-artifacts` | Strip leftover Docker-base-image artifacts from an **already-deployed** system | Target system (needs root) |
 
 `_cleanup` is an internal companion script — you never invoke it yourself.
 `create-debian-rootfs` bind-mounts it into the build container.
@@ -492,6 +493,68 @@ Copy rEFInd files only (no NVRAM registration), e.g. for removable media:
 
 ```bash
 sudo ./setup-efi -d /dev/sdb -n /mnt/rootfs
+```
+
+---
+
+## `purge-docker-artifacts`
+
+Strip leftover Docker-base-image artifacts from a system that was
+**already deployed** from an image built by an older version of
+`create-debian-rootfs` (before it stripped these files itself). Safe
+to run on a live production system.
+
+It removes, after verifying each file really is the Docker-shipped
+copy (its content contains the string `docker`):
+
+- `/usr/sbin/policy-rc.d` — Docker's `exit 101` guard that makes apt
+  silently skip all service start/restart/stop actions.
+- `/etc/apt/apt.conf.d/docker-clean`, `docker-no-languages`,
+  `docker-gzip-indexes`, `docker-autoremove-suggests` — Docker
+  apt-layer optimizations.
+- `/etc/dpkg/dpkg.cfg.d/docker-apt-speedup` — `force-unsafe-io`, a
+  data-corruption risk on power loss.
+
+A same-named file you created yourself (whose content does not match)
+is **left in place** and reported with a warning and a nonzero exit
+status, so you never lose a legitimate custom `policy-rc.d`.
+
+The script does **not** restart any service and does **not** run
+`apt-get update` automatically; it prints the recommended follow-up
+steps instead.
+
+### Usage
+
+```bash
+sudo ./purge-docker-artifacts [OPTIONS]
+```
+
+### Options
+
+| Option | Description |
+| --- | --- |
+| `-n, --dry-run` | Show what would be removed; change nothing. |
+| `-y, --yes` | Remove without the interactive confirmation prompt. |
+| `-h, --help` | Show the help message. |
+
+### Examples
+
+```bash
+# Preview first (always safe)
+sudo ./purge-docker-artifacts --dry-run
+
+# Remove, confirming interactively
+sudo ./purge-docker-artifacts
+
+# Remove unattended (e.g. over SSH/automation)
+sudo ./purge-docker-artifacts --yes
+```
+
+After running it, follow up with:
+
+```bash
+apt-get update                       # apply Languages/index changes
+systemctl start <unit>   # or reboot, to start services apt had skipped
 ```
 
 ---

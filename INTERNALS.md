@@ -31,9 +31,11 @@ It is responsible for:
 - Force-creating essential `/sbin/init`, `/sbin/halt`, `/sbin/reboot`, …
   symlinks that maintainer scripts sometimes skip in containers.
 - Setting / unlocking the root password.
-- Stripping Docker artifacts (`.dockerenv`, `Dockerfile`), apt caches/lists,
-  `/tmp` and `/var/tmp`, hostname, `resolv.conf`, `machine-id`, logs, SSH host
-  keys, udev persistent-net rules, user caches, bash history, `lost+found`.
+- Stripping Docker artifacts (`.dockerenv`, `Dockerfile`,
+  `/usr/sbin/policy-rc.d`, the `docker-*` apt and dpkg config drops),
+  apt caches/lists, `/tmp` and `/var/tmp`, hostname, `resolv.conf`,
+  `machine-id`, logs, SSH host keys, udev persistent-net rules, user
+  caches, bash history, `lost+found`.
 - Re-creating essential mount-point and `if-up.d`/`if-down.d` directories.
 - Staging rEFInd onto `${ESPROOT}/EFI/refind` when requested.
 
@@ -41,7 +43,10 @@ It is responsible for:
 
 | Item | Action |
 | --- | --- |
-| `.dockerenv`, `Dockerfile` | Removed |
+| `.dockerenv`, `Dockerfile`, `/.dockerinit` | Removed |
+| `/usr/sbin/policy-rc.d` (Docker's exit-101 service guard) | Removed |
+| `/etc/apt/apt.conf.d/docker-*` (4 files) | Removed |
+| `/etc/dpkg/dpkg.cfg.d/docker-apt-speedup` (`force-unsafe-io`) | Removed |
 | `/var/cache/apt/` | Cleaned (no `.deb` files) |
 | `/var/lib/apt/lists/` | Removed |
 | `/tmp/`, `/var/tmp/` | Emptied |
@@ -65,7 +70,8 @@ components, and the PVE repository are retained if `-B`, `-z`, or `-P` was used.
   `sys`, `dev`, `run`, `boot`).
 - Critical binaries/config (`/bin/sh`, `/bin/bash`, `/etc/passwd`,
   `/etc/shadow`, `/etc/fstab`, `/etc/os-release`, `sshd`, `ssh`, …).
-- No leftover Docker artifacts (`.dockerenv`, `Dockerfile`).
+- No leftover Docker artifacts (`.dockerenv`, `Dockerfile`,
+  `/usr/sbin/policy-rc.d`, `docker-*` apt/dpkg config files).
 - Clean apt cache (no `.deb` files).
 - Ownership/permissions from tar headers: `/etc/shadow` `0/42` mode `640`,
   `/etc/passwd` `0/0` mode `644`, `/usr/bin/su` setuid, `/tmp` sticky bit,
@@ -119,12 +125,13 @@ Exits `0` if all checks pass, `1` if any fail.
 
 ```
 .
-├── create-debian-rootfs   # Build a rootfs + boot tarball (host, uses Docker)
-├── _cleanup               # Configure & clean the rootfs (inside the container)
-├── test-rootfs            # Verify a produced tarball (host)
-├── setup-efi              # Install rEFInd on the ESP (host, needs root)
-├── README.md              # Usage guide (user-facing)
-└── INTERNALS.md           # This file (implementation details)
+├── create-debian-rootfs     # Build a rootfs + boot tarball (host, uses Docker)
+├── _cleanup                 # Configure & clean the rootfs (inside the container)
+├── test-rootfs              # Verify a produced tarball (host)
+├── setup-efi                # Install rEFInd on the ESP (host, needs root)
+├── purge-docker-artifacts   # Strip leftover Docker artifacts from an already-deployed system
+├── README.md                # Usage guide (user-facing)
+└── INTERNALS.md             # This file (implementation details)
 ```
 
 `_cleanup` is an internal companion script — you never invoke it directly;
