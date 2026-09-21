@@ -124,6 +124,7 @@ Build a Debian root filesystem tarball using Docker.
 | Option | Description |
 | --- | --- |
 | `-o, --output FILE` | Output filename for the rootfs tarball. Default: `debian-<codename>-rootfs.tar.gz` (or `pve-<codename>-rootfs.tar.gz` with `-P`). A second `-boot` tarball is auto-generated when a kernel is included. |
+| `-n, --name NAME` | Insert `NAME` into the default output filename, e.g. `debian-myname-trixie-rootfs.tar.gz` (or `pve-myname-trixie-...` with `-P`). Mutually exclusive with `-o`. |
 | `-O, --output-dir DIR` | Output directory; relocates the (default or `-o`) filename into it. The directory is created if missing. When combined with `-o`, only the basename of `-o` is kept. |
 | `-a, --arch ARCH` | Target architecture (`amd64`, `arm64`, `armhf`, …). Default: `amd64`. |
 | `-k, --with-kernel` | Include the Linux kernel and an initramfs in `/boot`. Produces a split rootfs+boot tarball. |
@@ -151,6 +152,11 @@ manages networking itself so `ifupdown` is omitted for `-P`).
 
 - **`-o`** — name your build for a custom deployment:
   `./create-debian-rootfs -o myrouter-bookworm.tar.gz bookworm`.
+- **`-n`** — insert a name into the default filename while keeping the
+  standard `debian-<name>-<codename>` layout:
+  `./create-debian-rootfs -n myrouter -k trixie` →
+  `debian-myrouter-trixie-rootfs.tar.gz` and
+  `debian-myrouter-trixie-boot.tar.gz`.
 - **`-O`** — write outputs to a shared build directory that other tooling
   watches, e.g. `./create-debian-rootfs -O /var/builds bookworm`.
 - **`-a`** — build for an ARM64 SBC: `./create-debian-rootfs -a arm64 -k trixie`.
@@ -277,6 +283,14 @@ Custom name inside `/var/builds`:
 
 ```bash
 ./create-debian-rootfs -O /var/builds -o my-rootfs.tar.xz trixie
+```
+
+Insert a name into the default filename:
+
+```bash
+./create-debian-rootfs -n myrouter -k trixie
+# -> debian-myrouter-trixie-rootfs.tar.gz
+#    debian-myrouter-trixie-boot.tar.gz
 ```
 
 Unattended overwrite of an existing tarball:

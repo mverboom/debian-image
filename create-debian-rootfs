@@ -20,6 +20,9 @@
 #   -o, --output FILE     Output filename (default:
 #                          debian-<codename>-rootfs.tar.gz,
 #                          or pve-<codename>-rootfs.tar.gz with -P)
+#   -n, --name NAME       Insert NAME into the default output
+#                          filename (e.g. debian-myname-trixie-
+#                          rootfs.tar.gz); mutually exclusive with -o
 #   -O, --output-dir DIR  Output directory (relocates the
 #                          rootfs and boot tarballs there)
 #   -a, --arch ARCH       Architecture (default: amd64)
@@ -105,6 +108,7 @@ readonly ARCH_KERNEL_MAP_armhf="armmp"
 CODENAME=""
 OUTPUT_FILE=""
 OUTPUT_DIR=""
+IMAGE_NAME=""
 ARCH="amd64"
 WITH_KERNEL=0
 WITH_REFIND=0
@@ -144,6 +148,9 @@ usage() {
 	                        or pve-<codename>-rootfs.tar.gz with -P)
 	                        A second tarball for /boot is automatically
 	                        generated when -k or -r is used.
+	  -n, --name NAME       Insert NAME into the default output
+	                        filename (e.g. debian-myname-trixie-
+	                        rootfs.tar.gz). Mutually exclusive with -o.
 	  -O, --output-dir DIR  Output directory for the rootfs and boot
 	                        tarballs. Relocates the (default or -o)
 	                        filename into this directory. The directory
@@ -198,6 +205,8 @@ usage() {
 	    debian-<codename>-boot.tar.gz
 	        (/boot contents, without boot/ prefix)
 	    With -P, the prefix changes to pve-<codename>.
+	    With -n NAME, NAME is inserted after the prefix, e.g.
+	    debian-myname-trixie-rootfs.tar.gz
 
 	Examples:
 	  ${SCRIPT_NAME} bookworm
@@ -229,6 +238,8 @@ usage() {
 	        # Default name in /var/builds (dir created)
 	  ${SCRIPT_NAME} -O /var/builds -o my-rootfs.tar.xz trixie
 	        # Custom name in /var/builds
+	  ${SCRIPT_NAME} -n myname trixie
+	        # debian-myname-trixie-rootfs.tar.gz
 	  ${SCRIPT_NAME} -k -f bookworm
 	        # Overwrite existing tarballs (unattended)
 	EOF
@@ -306,6 +317,10 @@ parse_args() {
       case "$1" in
          --output|-o)
             OUTPUT_FILE="$2"
+            shift 2
+            ;;
+         --name|-n)
+            IMAGE_NAME="$2"
             shift 2
             ;;
          --output-dir|-O)
@@ -462,6 +477,20 @@ validate_input() {
       WITH_KERNEL=1
    fi
 
+   # --name only affects the default filename, so it cannot
+   # be combined with --output (which sets the full filename).
+   if [[ -n "${IMAGE_NAME}" ]] && [[ -n "${OUTPUT_FILE}" ]]; then
+      error "--name and --output are mutually exclusive." \
+         "Use --name for the default filename or --output for" \
+         "a full filename, but not both."
+   fi
+
+   # --name is a filename component, not a path
+   if [[ -n "${IMAGE_NAME}" ]] && [[ "${IMAGE_NAME}" == */* ]]; then
+      error "--name must not contain '/'." \
+         "It is used as part of the output filename."
+   fi
+
    # Set default output filename
    if [[ -z "${OUTPUT_FILE}" ]]; then
       local ext
@@ -474,7 +503,11 @@ validate_input() {
       if [[ "${WITH_PVE}" -eq 1 ]]; then
          prefix="pve"
       fi
-      OUTPUT_FILE="${prefix}-${CODENAME}-rootfs.${ext}"
+      local name_part=""
+      if [[ -n "${IMAGE_NAME}" ]]; then
+         name_part="${IMAGE_NAME}-"
+      fi
+      OUTPUT_FILE="${prefix}-${name_part}${CODENAME}-rootfs.${ext}"
    fi
 
    # Apply --output-dir: relocate the output filename into the
